@@ -292,6 +292,11 @@ static int getChipFlag(int s) {
         case 3: return g_f.V; case 4: return g_f.S; case 5: return g_f.H; case 6: return g_f.T; }
     return g_f.I;
 }
+static void setChipFlag(int s, int v) {
+    switch (s%8) { case 0: g_f.C = v; break; case 1: g_f.Z = v; break; case 2: g_f.N = v; break;
+        case 3: g_f.V = v; break; case 4: g_f.S = v; break; case 5: g_f.H = v; break; case 6: g_f.T = v; break;
+        default: g_f.I = v; break; }
+}
 static uint16_t flashWord(int w) { int o = w*2; return (uint16_t)(g_flash[o] | (g_flash[o+1]<<8)); }
 
 // returns false on failure / stop. Sets opOut, cyOut
@@ -305,6 +310,41 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
 
     enum { NON = 0 };
     if (op == 0x0000) { }                                          // NOP
+    else if (op == 0x9698) {                                       // BREAK
+        wr(fmt(">> BREAK opcode at PC=0x%04X. Stopping.", g_pc), YELLOW);
+        g_running = false; return false;
+    }
+    else if ((op & 0xFF00) == 0x0100) {                            // MOVW (even pairs)
+        rd = ((op>>4)&0xF)*2; rr = (op&0xF)*2;
+        g_dmem[rd] = g_dmem[rr]; g_dmem[rd+1] = g_dmem[rr+1];
+    }
+    else if ((op & 0xFC00) == 0x9C00) {                            // MUL Rd,Rr (unsigned)
+        rd = (op>>4)&0x1F; rr = ((op>>5)&0x10) | (op&0xF);
+        uint16_t prod = (uint16_t)((uint16_t)g_dmem[rd] * (uint16_t)g_dmem[rr]);
+        g_dmem[0] = prod & 0xFF; g_dmem[1] = (prod>>8)&0xFF;
+        g_f.C = (prod>>15)&1; g_f.Z = (prod == 0); cy = 2;
+    }
+    else if ((op & 0xFF00) == 0x0200) {                            // MULS Rd,Rr (both signed)
+        rd = 16 + ((op>>4)&0xF); rr = 16 + (op&0xF);
+        int p = (int8_t)g_dmem[rd] * (int8_t)g_dmem[rr];
+        g_dmem[0] = p & 0xFF; g_dmem[1] = (p>>8)&0xFF;
+        g_f.C = (p>>15)&1; g_f.Z = ((p & 0xFFFF) == 0); cy = 2;
+    }
+    else if ((op & 0xFF80) == 0x0300) {                            // MULSU/FMUL/FMULS/FMULSU
+        rd = 16 + ((op>>4)&7); rr = 16 + (op&7);
+        int b7 = (op>>7)&1, b3 = (op>>3)&1;
+        int sat = (int8_t)g_dmem[rd], rat = g_dmem[rr];
+        uint32_t p;
+        switch ((b7<<1)|b3) {
+            case 0: p = (uint32_t)(sat * rat); break;                          // MULSU  s*u
+            case 1: p = (uint32_t)g_dmem[rd] * g_dmem[rr]; break;               // FMUL   u*u
+            case 2: p = (uint32_t)(sat * (int8_t)rat); break;                  // FMULSU s*u (<<1)
+            case 3: p = (uint32_t)(sat * (int8_t)rat); break;                  // FMULS  s*s (<<1)
+        }
+        if (b7) p <<= 1;                                   // FMUL-family: result shifted left
+        g_dmem[0] = p & 0xFF; g_dmem[1] = (p>>8)&0xFF;
+        g_f.C = (p>>16)&1; g_f.Z = ((p & 0xFFFF) == 0); cy = 2;
+    }
     else if ((op & 0xFC00) == 0x0C00) {                            // ADD
         rd = (op>>4)&0x1F; rr = ((op>>5)&0x10) | (op&0xF);
         int a = g_dmem[rd], r = a + g_dmem[rr];
@@ -443,6 +483,14 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
         uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B] << 8);
         nextPC = z / 2; cy = 2;
     }
+    else if ((op & 0xFE0F) == 0x9000) {                          // LDS Rd, k (2 words)
+        rd = (op>>4)&0x1F; uint16_t kk = flashWord(g_pc + 1);
+        g_dmem[rd] = readDmem(kk); nextPC = g_pc + 2; cy = 2;
+    }
+    else if ((op & 0xFE0F) == 0x9200) {                          // STS k, Rr (2 words)
+        rr = (op>>4)&0x1F; uint16_t kk = flashWord(g_pc + 1);
+        writeDmem(kk, g_dmem[rr]); nextPC = g_pc + 2; cy = 2;
+    }
     else if ((op & 0xFE0F) == 0x900C) {                          // LD Rd, X
         rd = (op>>4)&0x1F; uint16_t x = g_dmem[0x1A] | (g_dmem[0x1B]<<8);
         g_dmem[rd] = readDmem(x); cy = 2;
@@ -459,15 +507,11 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
         rd = (op>>4)&0x1F; uint16_t y = (g_dmem[0x18] | (g_dmem[0x19]<<8)) - 1;
         g_dmem[0x18] = y&0xFF; g_dmem[0x19] = (y>>8)&0xFF; g_dmem[rd] = readDmem(y); cy = 2;
     }
-    else if ((op & 0xFE0F) == 0x9001) {                          // LDD Rd, Y+q
+    else if ((op & 0xD200) == 0x8000) {                          // LDD Rd, Y+q / Z+q
         rd = (op>>4)&0x1F; int q = ((op&0x2000)>>8) | ((op&0x0C00)>>7) | (op&7);
-        uint16_t y = g_dmem[0x18] | (g_dmem[0x19]<<8);
-        g_dmem[rd] = readDmem(y + q); cy = 2;
-    }
-    else if ((op & 0xFE0F) == 0x9002) {                          // LDD Rd, Z+q
-        rd = (op>>4)&0x1F; int q = ((op&0x2000)>>8) | ((op&0x0C00)>>7) | (op&7);
-        uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B]<<8);
-        g_dmem[rd] = readDmem(z + q); cy = 2;
+        if (op & 8) { uint16_t y = g_dmem[0x18] | (g_dmem[0x19]<<8); g_dmem[rd] = readDmem(y + q); }
+        else        { uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B]<<8); g_dmem[rd] = readDmem(z + q); }
+        cy = 2;
     }
     else if ((op & 0xFE0F) == 0x900F) {                          // POP
         rd = (op>>4)&0x1F; g_dmem[rd] = (uint8_t)popByte(); cy = 2;
@@ -497,15 +541,15 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
         rr = (op>>4)&0x1F; uint16_t y = (g_dmem[0x18] | (g_dmem[0x19]<<8)) - 1;
         g_dmem[0x18] = y&0xFF; g_dmem[0x19] = (y>>8)&0xFF; writeDmem(y, g_dmem[rr]); cy = 2;
     }
-    else if ((op & 0xFE0F) == 0x9202) {                          // STD Z+q, Rr
-        rr = (op>>4)&0x1F; int q = ((op&0x2000)>>8) | ((op&0x0C00)>>7) | (op&7);
-        uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B]<<8);
-        writeDmem(z + q, g_dmem[rr]); cy = 2;
+    else if ((op & 0xFE0F) == 0x920E) {                          // ST -Z, Rr
+        rr = (op>>4)&0x1F; uint16_t z = (g_dmem[0x1A] | (g_dmem[0x1B]<<8)) - 1;
+        g_dmem[0x1A] = z&0xFF; g_dmem[0x1B] = (z>>8)&0xFF; writeDmem(z, g_dmem[rr]); cy = 2;
     }
-    else if ((op & 0xFE0F) == 0x9200) {                          // STD Y+q, Rr
+    else if ((op & 0xD200) == 0x8200) {                          // STD Y+q / Z+q, Rr
         rr = (op>>4)&0x1F; int q = ((op&0x2000)>>8) | ((op&0x0C00)>>7) | (op&7);
-        uint16_t y = g_dmem[0x18] | (g_dmem[0x19]<<8);
-        writeDmem(y + q, g_dmem[rr]); cy = 2;
+        if (op & 8) { uint16_t y = g_dmem[0x18] | (g_dmem[0x19]<<8); writeDmem(y + q, g_dmem[rr]); }
+        else        { uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B]<<8); writeDmem(z + q, g_dmem[rr]); }
+        cy = 2;
     }
     else if ((op & 0xFE0F) == 0x920F) {                          // PUSH
         rr = (op>>4)&0x1F; pushByte(g_dmem[rr]); cy = 2;
@@ -544,11 +588,34 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
         int r = (v>>1) | ((cin<<7)&0x80);
         g_dmem[rd] = (uint8_t)r; setShiftFlags(r, cout);
     }
+    else if ((op & 0xFF0F) == 0x9408) {                          // BSET s (SEC/SEZ/SEN/...)
+        setChipFlag((op>>4)&7, 1);
+    }
+    else if ((op & 0xFF0F) == 0x9488) {                          // BCLR s (CLC/CLU/CLN/...)
+        setChipFlag((op>>4)&7, 0);
+    }
+    else if (op == 0x9588) { cy = 1; }                           // SLEEP (ignored)
+    else if (op == 0x95A8) { cy = 1; }                           // WDR (ignored)
     else if ((op & 0xFE0F) == 0x940C) {                          // JMP (2 words)
         nextPC = flashWord(g_pc + 1) / 2; cy = 3;
     }
     else if ((op & 0xFE0F) == 0x940E) {                          // CALL (2 words)
         pushWord(g_pc + 2); nextPC = flashWord(g_pc + 1) / 2; cy = 4;
+    }
+    else if ((op & 0xFE08) == 0xFC00) {                          // SBRC Rr,b : skip if bit==0
+        rr = (op>>4)&0x1F;
+        if (!((g_dmem[rr] >> (op&7)) & 1)) { nextPC = g_pc + 2; cy = 2; }
+    }
+    else if ((op & 0xFE08) == 0xFE00) {                          // SBRS Rr,b : skip if bit==1
+        rr = (op>>4)&0x1F;
+        if ((g_dmem[rr] >> (op&7)) & 1) { nextPC = g_pc + 2; cy = 2; }
+    }
+    else if ((op & 0xFE08) == 0xFA00) {                          // BST Rd,b -> T
+        rd = (op>>4)&0x1F; g_f.T = (g_dmem[rd] >> (op&7)) & 1;
+    }
+    else if ((op & 0xFE08) == 0xF800) {                          // BLD Rd,b <- T
+        rd = (op>>4)&0x1F; int b = op&7;
+        g_dmem[rd] = (uint8_t)((g_dmem[rd] & ~(1<<b)) | (g_f.T << b));
     }
     else if ((op & 0xFC00) == 0xF000) {                            // BRBS
         int s = op & 7, kk = (op>>3)&0x7F; if (kk >= 0x40) kk -= 0x80;
@@ -576,16 +643,44 @@ static std::string decodeOp(uint16_t op) {
     char b[96];
     int d;
     if (op == 0x0000) return "NOP";
+    if ((op & 0xFF00) == 0x0100) { snprintf(b, sizeof b, "MOVW R%u, R%u", ((op>>4)&0xF)*2, (op&0xF)*2); return b; }
+    if ((op & 0xFC00) == 0x9C00) { snprintf(b, sizeof b, "MUL  R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b; }
+    if ((op & 0xFF00) == 0x0200) { snprintf(b, sizeof b, "MULS R%u, R%u", 16+((op>>4)&0xF), 16+(op&0xF)); return b; }
+    if ((op & 0xFF80) == 0x0300) {
+        static const char* fm[4] = {"MULSU","FMUL","FMULSU","FMULS"};
+        snprintf(b, sizeof b, "%s R%u, R%u", fm[((op>>7)&1)<<1 | (op>>3)&1], 16+((op>>4)&7), 16+(op&7)); return b;
+    }
+    if ((op & 0xFE0F) == 0x9000) { snprintf(b, sizeof b, "LDS  R%u, 0x%04X", (op>>4)&0x1F, flashWord(g_pc+1)); return b; }
+    if ((op & 0xFE0F) == 0x9200) { snprintf(b, sizeof b, "STS  0x%04X, R%u", flashWord(g_pc+1), (op>>4)&0x1F); return b; }
+    if ((op & 0xD200) == 0x8000) {
+        int q = ((op&0x2000)>>8) | ((op&0x0C00)>>7) | (op&7);
+        snprintf(b, sizeof b, "%s R%u, %c+%d", (op&8)?"LDD":"LDD", (op>>4)&0x1F, (op&8)?'Y':'Z', q); return b;
+    }
+    if ((op & 0xD200) == 0x8200) {
+        int q = ((op&0x2000)>>8) | ((op&0x0C00)>>7) | (op&7);
+        snprintf(b, sizeof b, "%s %c+%d, R%u", "STD", (op&8)?'Y':'Z', q, (op>>4)&0x1F); return b;
+    }
+    if ((op & 0xFF0F) == 0x9408 || (op & 0xFF0F) == 0x9488) {
+        static const char* fn[8] = {"C","Z","N","V","S","H","T","I"};
+        snprintf(b, sizeof b, "%s%s (flag %s)", (op&0xFF0F)==0x9408?"SE":"CL", fn[(op>>4)&7], fn[(op>>4)&7]); return b;
+    }
+    if (op == 0x9588) return "SLEEP";
+    if (op == 0x95A8) return "WDR";
+    if (op == 0x9698) return "BREAK";
+    if ((op & 0xFE08) == 0xFC00) { snprintf(b, sizeof b, "SBRC R%u, %u", (op>>4)&0x1F, op&7); return b; }
+    if ((op & 0xFE08) == 0xFE00) { snprintf(b, sizeof b, "SBRS R%u, %u", (op>>4)&0x1F, op&7); return b; }
+    if ((op & 0xFE08) == 0xFA00) { snprintf(b, sizeof b, "BST  R%u, %u", (op>>4)&0x1F, op&7); return b; }
+    if ((op & 0xFE08) == 0xF800) { snprintf(b, sizeof b, "BLD  R%u, %u", (op>>4)&0x1F, op&7); return b; }
     switch (op & 0xFC00) {
-        case 0x0C00: snprintf(b, sizeof b, "ADD  R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
-        case 0x1C00: snprintf(b, sizeof b, "ADC  R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
+        case 0x0C00: snprintf(b, sizeof b, "%s  R%u", ((op>>4)&0x1F)==((op>>5)&0x10)|(op&0xF) ? "LSL" : "ADD", (op>>4)&0x1F); return b;
+        case 0x1C00: snprintf(b, sizeof b, "%s  R%u", ((op>>4)&0x1F)==((op>>5)&0x10)|(op&0xF) ? "ROL" : "ADC", (op>>4)&0x1F); return b;
         case 0x1800: snprintf(b, sizeof b, "SUB  R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
         case 0x0800: snprintf(b, sizeof b, "SBC  R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
         case 0x1400: snprintf(b, sizeof b, "CP   R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
         case 0x0400: snprintf(b, sizeof b, "CPC  R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
         case 0x1000: snprintf(b, sizeof b, "CPSE R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
-        case 0x2000: snprintf(b, sizeof b, "AND  R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
-        case 0x2400: snprintf(b, sizeof b, "EOR  R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
+        case 0x2000: snprintf(b, sizeof b, "%s  R%u", ((op>>4)&0x1F)==((op>>5)&0x10)|(op&0xF) ? "TST" : "AND", (op>>4)&0x1F); return b;
+        case 0x2400: snprintf(b, sizeof b, "%s  R%u", ((op>>4)&0x1F)==((op>>5)&0x10)|(op&0xF) ? "CLR" : "EOR", (op>>4)&0x1F); return b;
         case 0x2800: snprintf(b, sizeof b, "OR   R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
         case 0x2C00: snprintf(b, sizeof b, "MOV  R%u, R%u", (op>>4)&0x1F, ((op>>5)&0x10)|(op&0xF)); return b;
         default: break;
@@ -602,8 +697,13 @@ static std::string decodeOp(uint16_t op) {
         case 0xD000: snprintf(b, sizeof b, "RCALL 0x%04X", g_pc + 1 + (op&0xFFF)); return b;
         case 0xB000: snprintf(b, sizeof b, "IN   R%u, 0x%02X", (op>>4)&0x1F, (op&0xF)|((op>>8)&3)<<4); return b;
         case 0xB800: snprintf(b, sizeof b, "OUT  0x%02X, R%u", (op&0xF)|((op>>8)&3)<<4, (op>>4)&0x1F); return b;
-        case 0xF000: snprintf(b, sizeof b, "%s s=%u, 0x%04X", (op&0xFC00)==0xF000?"BRBS":"BRBC", op&7,
-                              g_pc + 1 + (((op>>3)&0x7F) >= 0x40 ? ((op>>3)&0x7F)-0x80 : (op>>3)&0x7F)); return b;
+        case 0xF000: {                                            // BRBS/BRBC + aliases
+            static const char* nB[8] = {"BRCS","BREQ","BRMI","BRVS","BRGE","BRHS","BRTS","BRIE"};
+            static const char* nC[8] = {"BRCC","BRNE","BRPL","BRVC","BRLT","BRHC","BRTC","BRID"};
+            int s = op&7, kk = (op>>3)&0x7F; if (kk >= 0x40) kk -= 0x80;
+            const char* nm = (op&0xFC00)==0xF000 ? nB[s] : nC[s];
+            snprintf(b, sizeof b, "%s  0x%04X", nm, g_pc + 1 + kk); return b;
+        }
         default: break;
     }
     switch (op & 0xFE0F) {
@@ -749,6 +849,73 @@ static int runSelfTest() {
 
     if (!failCount) wr(fmt(" Self-test: ALL PASSED (%d checks)", passCount), GREEN);
     else wr(fmt(" Self-test: %d FAILED", failCount), RED);
+    return failCount;
+}
+
+// ---------------------------------------------------------------------
+// Self-test 2: new instructions (MOVW/MUL/LDS/STS/LDD/STD/BST/BLD/SBRS/SEC)
+// ---------------------------------------------------------------------
+static int runSelfTest2() {
+    int failCount = 0, passCount = 0;
+    auto tc = [&](const char* nm, int got, int want) {
+        if (got == want) { passCount++; wr(fmt("  [PASS] %s", nm), GREEN); }
+        else { failCount++; wr(fmt("  [FAIL] %s: got 0x%02X, want 0x%02X", nm, got, want), RED); }
+    };
+    wr("-- Emulator self-test 2 (MOVW/MUL/LDS/STS/LDD/STD/BST/BLD/SBRS/SEC)", CYAN);
+    static const uint8_t prog[] = {
+        0x0F,0xEF,   // LDI R16,0xFF
+        0x08,0x94,   // SEC  (BSET 0)
+        0x03,0xFB,   // BST R16,3   -> T=1
+        0x10,0xE0,   // LDI R17,0x00
+        0x15,0xF9,   // BLD R17,5   -> R17=0x20
+        0x15,0xFF,   // SBRS R17,5  -> skip next (bit5==1)
+        0x77,0xE2,   // LDI R18,0x77   (must be skipped)
+        0x98,0x01,   // MOVW R18:19 <- R16:17
+        0x8F,0xE0,   // LDI R24,15
+        0x80,0x9F,   // MUL R24,R16 -> R1:R0 = 15*255 = 0x0EF1
+        0x00,0x93,   // STS 0x61, R0
+        0x61,0x00,
+        0x40,0x91,   // LDS R20, 0x61 -> 0xF1
+        0x61,0x00,
+        0xE0,0xE6,   // LDI R30,0x60 (Z low)
+        0xF0,0xE0,   // LDI R31,0    (Z high)
+        0x12,0x82,   // STD Z+2, R1  -> [0x62] = 0x0E
+        0x51,0x81,   // LDD R21, Z+1 <- [0x61] = 0xF1
+        0x62,0x81 }; // LDD R22, Z+2 <- [0x62] = 0x0E
+    memset(g_flash, 0xFF, sizeof(g_flash));
+    memcpy(g_flash, prog, sizeof(prog));
+    std::fill(g_dmem.begin(), g_dmem.end(), 0);
+    g_dmem[0x5D] = RAM_END & 0xFF; g_dmem[0x5E] = (RAM_END>>8)&0xFF;
+    g_loaded = true; g_pc = 0; g_cycles = 0; g_f = {};
+
+    uint16_t op; int cy;
+    for (int i = 0; i < 6; i++) { execOne(op, cy); wr(fmt("  dbg pc=0x%04X op=0x%04X %s", g_pc, op, decodeOp(op).c_str()), CYAN); }
+    tc("SEC (BSET0) C=1", g_f.C, 1);
+    tc("BST R16,3 -> T=1", g_f.T, 1);
+    tc("BLD R17,5 -> 0x20", g_dmem[17], 0x20);
+    tc("SBRS skipped LDI (R18=0)", g_dmem[18], 0);
+    execOne(op, cy);                                     // MOVW
+    wr(fmt("  dbg pc=0x%04X op=0x%04X R0=0x%02X R1=0x%02X [0x60]=0x%02X [0x61]=0x%02X [0x62]=0x%02X", g_pc, op, g_dmem[0], g_dmem[1], g_dmem[0x60], g_dmem[0x61], g_dmem[0x62]), CYAN);
+    tc("MOVW R18 = 0xFF", g_dmem[18], 0xFF);
+    tc("MOVW R19 = 0x20", g_dmem[19], 0x20);
+    execOne(op, cy); execOne(op, cy);                    // LDI R24, MUL
+    tc("MUL R0 = 0xF1", g_dmem[0], 0xF1);
+    tc("MUL R1 = 0x0E", g_dmem[1], 0x0E);
+    execOne(op, cy);                                     // STS 0x61, R0
+    wr(fmt("  dbg STS: pc=0x%04X op=0x%04X R0=0x%02X [0x61]=0x%02X", g_pc, op, g_dmem[0], g_dmem[0x61]), CYAN);
+    execOne(op, cy);                                     // LDS R20
+    wr(fmt("  dbg LDS: pc=0x%04X op=0x%04X R20=0x%02X kk-PC-th word test", g_pc, op, g_dmem[20]), CYAN);
+    tc("LDS/STS R20 = 0xF1", g_dmem[20], 0xF1);
+    execOne(op, cy); execOne(op, cy);                    // Z = 0x60 (LDI R30/R31)
+    execOne(op, cy);                                     // STD Z+2, R1
+    tc("STD [0x62] = 0x0E", g_dmem[0x62], 0x0E);
+    execOne(op, cy);                                     // LDD R21, Z+1
+    tc("LDD R21 = 0xF1", g_dmem[21], 0xF1);
+    execOne(op, cy);                                     // LDD R22, Z+2
+    tc("LDD R22 = 0x0E", g_dmem[22], 0x0E);
+
+    if (!failCount) wr(fmt(" Self-test 2: ALL PASSED (%d checks)", passCount), GREEN);
+    else wr(fmt(" Self-test 2: %d FAILED", failCount), RED);
     return failCount;
 }
 
@@ -981,6 +1148,7 @@ static bool dispatch(const std::string& line) {
     }
     if (cmd == "quit" || cmd == "exit" || cmd == "q") return false;
     if (cmd == "selftest") { runSelfTest(); return true; }
+    if (cmd == "selftest2" || cmd == "st2") { runSelfTest2(); return true; }
     if (cmd == "quiet") { g_quiet = true; return true; }
     if (cmd == "help" || cmd == "?") {
         wr("Commands (from README sec.12):", CYAN);
@@ -989,7 +1157,7 @@ static bool dispatch(const std::string& line) {
         wr("  reg [R#|sreg|all] [=val] port <B|C|D>   pin <P#|P#bit> <v|toggle>");
         wr("  mem <sram|flash> <addr> [len]    ba <addr|symbol>   bl  bd <n|all>");
         wr("  tr (timer reset)  size  da (disasm)  w <addr> (watch)  silent ");
-        wr("  silent  quiet  help  selftest  quit");
+        wr("  silent  quiet  help  selftest  selftest2  quit");
         return true;
     }
     wr("Unknown command: " + cmd + ". Type 'help'.", RED);
