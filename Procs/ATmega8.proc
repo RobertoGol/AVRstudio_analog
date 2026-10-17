@@ -1,0 +1,130 @@
+# AVR CLI Studio processor profile (README sec.8) - generated from toolchain headers
+
+[Identity]
+Name = ATmega8
+MCU_Target = atmega8
+Define_Tag = __AVR_ATmega8__
+Default_F_CPU = 1000000
+InstructSetCore = avr4
+
+[Memory]
+FlashEnd = 0x1FFF        # last FLASH byte address (bytes: ATmega8)
+RegFileStart = 0x0000  # GP registers R0-R31
+RegFileEnd = 0x001F
+IoStart = 0x0020     # I/O registers in SRAM view (IN/OUT addr = here - 0x20)
+ExtIoEnd = 0x005F    # I/O space end in SRAM view (IN/OUT reachable to 0x5F)
+SRAMStart = 0x0060
+RamEnd = 0x045F        # stack top (SP init)
+EepromEnd = 0x01FF
+
+[Ports]
+# Port token = PIN_IO DDR_IO PORT_IO  (I/O addresses; IN/OUT space)
+B = 0x16 0x17 0x18
+C = 0x13 0x14 0x15
+D = 0x10 0x11 0x12
+
+[Interrupts]
+# vector_index = name ; FLASH address = index*2 (each vector = 1 word RJMP slot)
+1 = INT0_vect
+2 = INT1_vect
+3 = TIMER2_COMP_vect
+4 = TIMER2_OVF_vect
+5 = TIMER1_CAPT_vect
+6 = TIMER1_COMPA_vect
+7 = TIMER1_COMPB_vect
+8 = TIMER1_OVF_vect
+9 = TIMER0_OVF_vect
+10 = SPI_STC_vect
+11 = USART_RXC_vect
+12 = USART_UDRE_vect
+13 = USART_TXC_vect
+14 = ADC_vect
+15 = EE_RDY_vect
+16 = ANA_COMP_vect
+17 = TWI_vect
+18 = SPM_RDY_vect
+
+[RegisterMap]
+# Name|Type|Addr ; Type: IO = IN/OUT space, MEM = mapped SRAM only (extend. I/O)
+# SRAM view address = IO + 0x20
+SREG|IO8|0x3F
+SPL|IO8|0x3D
+SPH|IO8|0x3E
+TWBR|IO8|0x00
+TWSR|IO8|0x01
+TWAR|IO8|0x02
+TWDR|IO8|0x03
+ADCL|IO8|0x04
+ADCH|IO8|0x05
+ADCSR|IO8|0x06
+ADCSRA|IO8|0x06
+ADMUX|IO8|0x07
+ACSR|IO8|0x08
+UBRRL|IO8|0x09
+UCSRB|IO8|0x0A
+UCSRA|IO8|0x0B
+UDR|IO8|0x0C
+SPCR|IO8|0x0D
+SPSR|IO8|0x0E
+SPDR|IO8|0x0F
+PIND|IO8|0x10
+DDRD|IO8|0x11
+PORTD|IO8|0x12
+PINC|IO8|0x13
+DDRC|IO8|0x14
+PORTC|IO8|0x15
+PINB|IO8|0x16
+DDRB|IO8|0x17
+PORTB|IO8|0x18
+EECR|IO8|0x1C
+EEDR|IO8|0x1D
+EEARL|IO8|0x1E
+EEARH|IO8|0x1F
+UCSRC|IO8|0x20
+UBRRH|IO8|0x20
+WDTCR|IO8|0x21
+ASSR|IO8|0x22
+OCR2|IO8|0x23
+TCNT2|IO8|0x24
+TCCR2|IO8|0x25
+ICR1L|IO8|0x26
+ICR1H|IO8|0x27
+OCR1BL|IO8|0x28
+OCR1BH|IO8|0x29
+OCR1AL|IO8|0x2A
+OCR1AH|IO8|0x2B
+TCNT1L|IO8|0x2C
+TCNT1H|IO8|0x2D
+TCCR1B|IO8|0x2E
+TCCR1A|IO8|0x2F
+SFIOR|IO8|0x30
+OSCCAL|IO8|0x31
+TCNT0|IO8|0x32
+TCCR0|IO8|0x33
+MCUCSR|IO8|0x34
+MCUSR|IO8|0x34
+MCUCR|IO8|0x35
+TWCR|IO8|0x36
+SPMCR|IO8|0x37
+TIFR|IO8|0x38
+TIMSK|IO8|0x39
+GIFR|IO8|0x3A
+GIMSK|IO8|0x3B
+GICR|IO8|0x3B
+
+[Cycles]
+# Instruction clocks (avr4 core)
+LDI/MOV/MOVW/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SER/BST/BLD/BSET/BCLR = 1
+LSL/LSR/ROL/ROR/ASR = 1
+MUL/MULS/MULSU/FMUL = 2
+ADIW/SBIW/LDS/STS/LD/ST/LPM/IN/OUT/PUSH/POP/SBI/CBI/SBRC/SBRS/SBIC/SBIS/SEC (SE/CL aliases)/CP/SUBI variants = 1-2
+RJMP/RCALL (not taken) branch/IJMP/ICALL/JMP = 2
+Branch taken = 2 ; not taken = 1
+RCALL = 3 ; RET/RETI/JMP/CALL = 4
+StopWatch: Time_us = Cycles * 1000000 / F_CPU
+
+[GPIO rules]
+# DDRx=1 -> output: PIN reads PORT latch (or stimulus level if external)
+# DDRx=0 & PORTx=1 -> input with pull-up: PIN reads 1 unless external stimulus is 0
+# DDRx=0 & PORTx=0 -> Hi-Z: floating, PIN reads external stimulus
+# Writing 1 to PINx bit (with DDRx=1) toggles PORTx latch

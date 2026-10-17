@@ -21,11 +21,11 @@
 // ---------------------------------------------------------------------
 // CPU state
 // ---------------------------------------------------------------------
-static constexpr uint32_t FLASH_END = 0x2000;   // 8KB (ATmega8)
-static constexpr uint32_t DMEM_SIZE = 0x460;    // R0-31(0-1F) + I/O(20-5F) + SRAM(60-45F)
-static constexpr uint16_t RAM_END   = 0x045F;
+static uint32_t FLASH_END = 0x2000;   // last FLASH byte (set from profile; ATmega8 = 0x2000)
+static uint32_t DMEM_SIZE = 0x460;    // RAM_END+1
+static uint16_t RAM_END   = 0x045F;
 
-static uint8_t  g_flash[FLASH_END] = {0xFF};
+static std::vector<uint8_t> g_flash(FLASH_END, 0xFF);
 static std::vector<uint8_t> g_dmem(DMEM_SIZE, 0);
 static uint16_t g_pc = 0;           // in WORDS
 static uint64_t g_cycles = 0;
@@ -36,11 +36,18 @@ static bool     g_quiet   = false;
 // SREG flags
 static struct { int I,T,H,S,V,N,Z,C; } g_f = {};
 
-// GPIO external stimulus: per port forced mask + forced value
-static struct { uint8_t mask, level; } g_ext[3] = {{0,0},{0,0},{0,0}};
-// port index: 0=B,1=C,2=D ; IO addresses
-static struct { int pin, ddr, port; } g_pio[3] = {{0x16,0x17,0x18},{0x13,0x14,0x15},{0x10,0x11,0x12}};
-static const char* g_pname[3] = {"B","C","D"};
+// GPIO external stimulus: per port forced mask + forced value (runtime, from profile)
+struct ExtStim { uint8_t mask, level; };
+static std::vector<ExtStim> g_ext = { {0,0},{0,0},{0,0} };
+// port maps: IO addresses {PIN, DDR, PORT} + letter names
+struct Pio { int pin, ddr, port; };
+static std::vector<Pio> g_pio = { {0x16,0x17,0x18},{0x13,0x14,0x15},{0x10,0x11,0x12} };
+static std::vector<std::string> g_pname = { "B","C","D" };
+static int portIndex(char c) {
+    for (int i = 0; i < (int)g_pio.size(); i++)
+        if (toupper((unsigned char)g_pname[i][0]) == toupper((unsigned char)c)) return i;
+    return -1;
+}
 
 // config
 static std::string g_chip = "ATmega8A";
@@ -50,6 +57,17 @@ static uint32_t    g_fcpu = 8000000;
 // breakpoints: index by PC (word). value = id
 static std::map<uint16_t,int> g_bp;
 static std::map<uint16_t,int>::size_type g_bpSerial = 1;
+// internal temp breakpoints (next/until); cleared after each command
+static std::map<uint16_t,int> g_bpTemp;
+
+// call-family detection (for step-over semantics)
+static bool isCallOp(uint16_t op) {
+    if ((op & 0xF000) == 0xD000) return true;          // RCALL
+    if ((op & 0xFE0F) == 0x940E) return true;          // JMP/CALL (2-word)
+    if (op == 0x9509 || op == 0x9519) return true;     // ICALL/EICALL
+    return false;
+}
+static int isCall2Word(uint16_t op) { return ((op & 0xFE0F) == 0x940E) ? 2 : 1; }
 
 // watch: {name, sram addr}
 struct Watch { std::string name; uint16_t addr; };
@@ -113,18 +131,45 @@ static std::map<std::string,std::string> readPairs(const std::string& path) {
     return out;
 }
 
+static uint64_t parseAddr(const std::string& sv) {
+    std::string v = sv;
+    size_t h = v.find('#'); if (h != std::string::npos) v = v.substr(0, h);
+    v.erase(0, v.find_first_not_of(" \t")); v.erase(v.find_last_not_of(" \t\r")+1);
+    if (v.empty()) return 0;
+    return strtoull(v.c_str(), nullptr, 0);   // handles 0xNN and decimal
+}
+
 static void loadEnv() {
     auto cfg = readPairs(g_root + "/echo.ctos");
     auto it  = [&cfg](const char* k){ auto i = cfg.find(k); return i!=cfg.end()? i->second : std::string(); };
     if (!it("mcu_target").empty())       g_mcu  = it("mcu_target");
     if (!it("processorprofile").empty()) g_chip = it("processorprofile");
-    if (!it("f_cpu").empty())  g_fcpu = (uint32_t)atoll(it("f_cpu").c_str());  // 8000000UL -> atol ok
+    if (!it("f_cpu").empty())  g_fcpu = (uint32_t)atoll(it("f_cpu").c_str());
 
     std::string prof = g_root + "/Procs/" + g_chip + ".proc";
     auto p = readPairs(prof);
     auto pit = [&p](const char* k){ auto i = p.find(k); return i!=p.end()? i->second : std::string(); };
-    if (!pit("name").empty())     g_chip = pit("name");
-    if (!pit("ramend").empty())   { /* RAM fixed for atmega8 */ }
+    if (!pit("name").empty()) g_chip = pit("name");
+    // memory geometry from profile (README sec.8: [Memory] keys)
+    std::string fe = pit("flashend"), re = pit("ramend");
+    if (!fe.empty()) { uint64_t v = parseAddr(fe); if (v >= 256 && v <= 256*1024) { FLASH_END = (uint32_t)v; g_flash.assign(FLASH_END, 0xFF); } }
+    if (!re.empty()) { uint64_t v = parseAddr(re); if (v >= 64 && v <= 64*1024) { RAM_END = (uint16_t)v; DMEM_SIZE = RAM_END + 1; g_dmem.assign(DMEM_SIZE, 0); } }
+    // [Ports]: single-letter keys "B = PIN_IO DDR_IO PORT_IO"
+    std::vector<Pio> np; std::vector<std::string> nn;
+    for (auto& kv : p) {                                   // map sorted: A,B,C,D order
+        const std::string& k = kv.first; const std::string& v = kv.second;
+        if (k.size() != 1 || !isalpha((unsigned char)k[0])) continue;
+        if (v.find("0x") == std::string::npos && v.find("0X") == std::string::npos) continue;
+        // strip inline comment, collect 3 hex tokens (PIN DDR PORT)
+        std::string vl = v; size_t hsh = vl.find('#');
+        if (hsh != std::string::npos) vl = vl.substr(0, hsh);
+        unsigned pinv, ddrv, portv;
+        if (sscanf(vl.c_str(), "%x %x %x", &pinv, &ddrv, &portv) == 3) {
+            nn.push_back(std::string(1, (char)toupper((unsigned char)k[0])));
+            np.push_back({ (int)pinv, (int)ddrv, (int)portv });
+        }
+    }
+    if (!np.empty()) { g_pio = np; g_pname = nn; g_ext.clear(); g_ext.resize(np.size()); }
 }
 
 // ---------------------------------------------------------------------
@@ -132,7 +177,7 @@ static void loadEnv() {
 // ---------------------------------------------------------------------
 static uint8_t readDmem(int a) {
     if (a < 0 || a >= (int)DMEM_SIZE) return 0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < (int)g_pio.size(); i++) {
         int pinRam = 0x20 + g_pio[i].pin;
         if (a == pinRam) {
             uint8_t ddr = g_dmem[0x20 + g_pio[i].ddr];
@@ -223,15 +268,16 @@ static uint32_t rD(const std::vector<uint8_t>& b, int o) {
 }
 static uint16_t rW(const std::vector<uint8_t>& b, int o) { return b[o] | (b[o+1]<<8); }
 
+static void parseDwarfLine(const std::vector<uint8_t>& b, uint32_t off, uint32_t size);
 static bool loadElfSys(const std::string& path, std::string& err) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { err = "cannot open " + path; return false; }
     std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (b.size() < 52 || b[0] != 0x7F || b[1] != 'E') { err = "not an ELF file"; return false; }
 
-    memset(g_flash, 0xFF, sizeof(g_flash));
+    g_flash.assign(FLASH_END, 0xFF);
     std::fill(g_dmem.begin(), g_dmem.end(), 0);
-    for (int i = 0; i < 3; i++) { g_ext[i].mask = 0; g_ext[i].level = 0; }
+    for (int i = 0; i < (int)g_pio.size(); i++) { g_ext[i].mask = 0; g_ext[i].level = 0; }
     g_f = {}; g_pc = 0; g_cycles = 0; g_running = false;
     g_dmem[0x5D] = RAM_END & 0xFF; g_dmem[0x5E] = (RAM_END >> 8) & 0xFF;
 
@@ -250,8 +296,146 @@ static bool loadElfSys(const std::string& path, std::string& err) {
         loaded++;
     }
     if (!loaded) { err = "no PT_LOAD segments"; return false; }
+    // DWARF .debug_line → (addr, line) table for line-exact stepping
+    {
+        uint32_t dshoff = rD(b, 32); uint16_t dshnum = rW(b, 48);
+        uint16_t shstrIdx = rW(b, 0x32);
+        int so = (int)dshoff + shstrIdx * 40;
+        uint32_t strTabOff = rD(b, so + 16), strTabSize = rD(b, so + 20);
+        for (int i = 0; i < (int)dshnum; i++) {
+            int s = (int)dshoff + i * 40;
+            if (s + 40 > (int)b.size()) break;
+            uint32_t off = rD(b, s + 16), sz = rD(b, s + 20);
+            uint32_t nameOff = rD(b, s + 0);
+            std::string nm;
+            if (nameOff < strTabSize) {
+                uint32_t q = strTabOff + nameOff;
+                while (q < b.size() && b[q] != 0) { nm += (char)b[q]; ++q; }
+            }
+            if (nm == ".debug_line") { parseDwarfLine(b, off, sz); break; }
+        }
+    }
     g_loaded = true;
     return true;
+}
+
+// ---------------------------------------------------------------------
+// DWARF .debug_line parser (DWARF v2/3/4): builds (byte-addr, line) rows
+// so next/step/bp/until can stop on EXACT C source lines (README sec.12)
+// ---------------------------------------------------------------------
+static std::vector<uint32_t>   g_lnAddr;   // byte address in program space
+static std::vector<int>        g_lnLine;
+static std::vector<uint8_t>    g_lnEnd;    // end_sequence marker
+static bool                    g_hasLines = false;
+
+static uint64_t rdULEB(const std::vector<uint8_t>& b, uint32_t& p) {
+    uint64_t r = 0; int sh = 0;
+    for (;;) { uint8_t x = b[p++]; r |= (uint64_t)(x & 0x7F) << sh; sh += 7; if (!(x & 0x80)) break; }
+    return r;
+}
+static int64_t rdSLEB(const std::vector<uint8_t>& b, uint32_t& p) {
+    int64_t r = 0; int sh = 0; uint8_t x;
+    do { x = b[p++]; r |= (int64_t)(x & 0x7F) << sh; sh += 7; } while (x & 0x80);
+    if (sh < 64 && (x & 0x40)) r |= -(((int64_t)1) << sh);
+    return r;
+}
+static void lnRow(uint32_t a, int l, uint8_t e) { g_lnAddr.push_back(a); g_lnLine.push_back(l); g_lnEnd.push_back(e); }
+
+static void parseDwarfLine(const std::vector<uint8_t>& b, uint32_t off, uint32_t size) {
+    g_lnAddr.clear(); g_lnLine.clear(); g_lnEnd.clear(); g_hasLines = false;
+    uint32_t p = off, endP = off + size;
+    if (endP > b.size()) endP = (uint32_t)b.size();
+    while (p + 10 <= endP) {
+        uint32_t uLen = rD(b, p); p += 4;
+        if (uLen == 0xFFFFFFFFu) return;               // 64-bit DWARF: not supported
+        if (p + uLen > endP) return;
+        uint32_t uNext = p + uLen;
+        uint16_t ver = rW(b, p); p += 2;
+        if (ver < 2 || ver > 4) { p = uNext; continue; }
+        p += 4;                                        // header_length
+        uint32_t mInst = b[p++]; if (mInst == 0) mInst = 1;
+        if (ver >= 4) p += 1;                          // max_ops_per_inst
+        p += 1;                                        // default_is_stmt
+        int lb = (int8_t)b[p++];                       // line_base
+        int lr = b[p++]; if (lr == 0) lr = 1;          // line_range
+        uint8_t ob = b[p++];                           // opcode_base
+        p += (ob > 1) ? (ob - 1) : 0;                  // std_opcode_lengths
+        while (p < uNext && b[p] != 0) { p++; } p++;    // include_directories (skip)
+        p++;                                           // terminator
+        while (p < uNext && b[p] != 0) {               // file_names (skip)
+            while (p < uNext && b[p] != 0) p++; p++;
+            (void)rdULEB(b, p); (void)rdULEB(b, p); (void)rdULEB(b, p);
+        }
+        if (p < uNext) p++;                            // file terminator
+        uint32_t addr = 0; int line = 1;
+        while (p < uNext) {
+            uint8_t op = b[p++];
+            if (op >= ob) {
+                uint32_t adj = (uint32_t)(op - ob);
+                addr += (adj / (uint32_t)lr) * mInst;
+                line += lb + (int)(adj % (uint32_t)lr);
+                lnRow(addr, line, 0);
+                continue;
+            }
+            if (op == 0) {
+                uint32_t len = (uint32_t)rdULEB(b, p);
+                uint32_t q = p;
+                uint8_t sub = (q < b.size()) ? b[q] : 0;
+                if (sub == 1) { lnRow(addr, line, 1); addr = 0; line = 1; }
+                else if (sub == 2) { addr = rD(b, q + 1); }
+                // DW_LNE_define_file etc.: ignored
+                p = q + len;               // ULEB len counts sub-opcode byte too
+                continue;
+            }
+            switch (op) {
+                case 1: lnRow(addr, line, 0); break;                        // copy
+                case 2: addr += (uint32_t)rdULEB(b, p) * mInst; break;      // advance_pc
+                case 3: line += (int)rdSLEB(b, p); break;                   // advance_line
+                case 4: (void)rdULEB(b, p); break;                          // set_file
+                case 5: (void)rdULEB(b, p); break;                          // set_column
+                case 8: { uint32_t a2 = 255 - (uint32_t)ob; addr += (a2 / (uint32_t)lr) * mInst; } break; // const_add_pc
+                case 9: addr += rW(b, p); p += 2; break;                    // fixed_advance_pc
+                case 12: (void)rdULEB(b, p); break;                         // set_isa
+                default: break;
+            }
+        }
+        p = uNext;
+    }
+    if (!g_lnAddr.empty()) {
+        // robust sort by address (stable)
+        std::vector<uint32_t> idx(g_lnAddr.size());
+        for (uint32_t i = 0; i < idx.size(); i++) idx[i] = i;
+        std::sort(idx.begin(), idx.end(), [&](uint32_t i, uint32_t j){ return g_lnAddr[i] < g_lnAddr[j]; });
+        std::vector<uint32_t> a2; std::vector<int> l2; std::vector<uint8_t> e2;
+        for (auto i : idx) { a2.push_back(g_lnAddr[i]); l2.push_back(g_lnLine[i]); e2.push_back(g_lnEnd[i]); }
+        g_lnAddr.swap(a2); g_lnLine.swap(l2); g_lnEnd.swap(e2);
+        g_hasLines = true;
+    }
+}
+
+// last non-end row with addr <= A → its line (-1 none)
+static int lineOfAddr(uint32_t a) {
+    int best = -1;
+    for (uint32_t i = 0; i < g_lnAddr.size(); i++)
+        if (!g_lnEnd[i] && g_lnAddr[i] <= a) best = (int)i;
+    return best >= 0 ? g_lnLine[best] : -1;
+}
+// first address whose line == LN
+static uint32_t firstAddrOfLine(int ln) {
+    for (uint32_t i = 0; i < g_lnAddr.size(); i++)
+        if (!g_lnEnd[i] && g_lnLine[i] == ln) return g_lnAddr[i];
+    return 0;
+}
+// smallest row address > A with a different source line
+static uint32_t nextLineAddr(uint32_t a) {
+    int cur = lineOfAddr(a);
+    uint32_t best = 0;
+    for (uint32_t i = 0; i < g_lnAddr.size(); i++) {
+        if (g_lnEnd[i] || g_lnAddr[i] <= a) continue;
+        if (g_lnLine[i] == cur) continue;
+        if (best == 0 || g_lnAddr[i] < best) best = g_lnAddr[i];
+    }
+    return best;
 }
 static bool findSymbol(const std::string& name, uint32_t& valueOut) {
     std::ifstream f(g_elf, std::ios::binary);
@@ -476,11 +660,11 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
     else if (op == 0x9518) { g_f.I = 1; nextPC = popWord(); cy = 4; }  // RETI
     else if (op == 0x9509) {                                     // ICALL
         pushWord(g_pc + 1);
-        uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B] << 8);
+        uint16_t z = g_dmem[0x1E] | (g_dmem[0x1F] << 8);
         nextPC = z / 2; cy = 3;
     }
     else if (op == 0x9409) {                                     // IJMP
-        uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B] << 8);
+        uint16_t z = g_dmem[0x1E] | (g_dmem[0x1F] << 8);
         nextPC = z / 2; cy = 2;
     }
     else if ((op & 0xFE0F) == 0x9000) {                          // LDS Rd, k (2 words)
@@ -500,30 +684,30 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
         g_dmem[rd] = readDmem(x); x++; g_dmem[0x1A] = x&0xFF; g_dmem[0x1B] = (x>>8)&0xFF; cy = 2;
     }
     else if ((op & 0xFE0F) == 0x9009) {                          // LD Rd, Y+
-        rd = (op>>4)&0x1F; uint16_t y = g_dmem[0x18] | (g_dmem[0x19]<<8);
-        g_dmem[rd] = readDmem(y); y++; g_dmem[0x18] = y&0xFF; g_dmem[0x19] = (y>>8)&0xFF; cy = 2;
+        rd = (op>>4)&0x1F; uint16_t y = g_dmem[0x1C] | (g_dmem[0x1D]<<8);
+        g_dmem[rd] = readDmem(y); y++; g_dmem[0x1C] = y&0xFF; g_dmem[0x1D] = (y>>8)&0xFF; cy = 2;
     }
     else if ((op & 0xFE0F) == 0x900A) {                          // LD Rd, -Y
-        rd = (op>>4)&0x1F; uint16_t y = (g_dmem[0x18] | (g_dmem[0x19]<<8)) - 1;
-        g_dmem[0x18] = y&0xFF; g_dmem[0x19] = (y>>8)&0xFF; g_dmem[rd] = readDmem(y); cy = 2;
+        rd = (op>>4)&0x1F; uint16_t y = (g_dmem[0x1C] | (g_dmem[0x1D]<<8)) - 1;
+        g_dmem[0x1C] = y&0xFF; g_dmem[0x1D] = (y>>8)&0xFF; g_dmem[rd] = (uint8_t)readDmem(y); cy = 2;
     }
     else if ((op & 0xD200) == 0x8000) {                          // LDD Rd, Y+q / Z+q
         rd = (op>>4)&0x1F; int q = ((op&0x2000)>>8) | ((op&0x0C00)>>7) | (op&7);
-        if (op & 8) { uint16_t y = g_dmem[0x18] | (g_dmem[0x19]<<8); g_dmem[rd] = readDmem(y + q); }
-        else        { uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B]<<8); g_dmem[rd] = readDmem(z + q); }
+        if (op & 8) { uint16_t y = g_dmem[0x1C] | (g_dmem[0x1D]<<8); g_dmem[rd] = readDmem(y + q); }
+        else        { uint16_t z = g_dmem[0x1E] | (g_dmem[0x1F]<<8); g_dmem[rd] = readDmem(z + q); }
         cy = 2;
     }
     else if ((op & 0xFE0F) == 0x900F) {                          // POP
         rd = (op>>4)&0x1F; g_dmem[rd] = (uint8_t)popByte(); cy = 2;
     }
     else if ((op & 0xFE0F) == 0x9004) {                          // LPM Rd, Z
-        rd = (op>>4)&0x1F; uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B]<<8);
+        rd = (op>>4)&0x1F; uint16_t z = g_dmem[0x1E] | (g_dmem[0x1F]<<8);
         g_dmem[rd] = z < FLASH_END ? g_flash[z] : 0xFF; cy = 3;
     }
     else if ((op & 0xFE0F) == 0x9005) {                          // LPM Rd, Z+
-        rd = (op>>4)&0x1F; uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B]<<8);
+        rd = (op>>4)&0x1F; uint16_t z = g_dmem[0x1E] | (g_dmem[0x1F]<<8);
         g_dmem[rd] = z < FLASH_END ? g_flash[z] : 0xFF; z++;
-        g_dmem[0x1A] = z&0xFF; g_dmem[0x1B] = (z>>8)&0xFF; cy = 3;
+        g_dmem[0x1E] = z&0xFF; g_dmem[0x1F] = (z>>8)&0xFF; cy = 3;
     }
     else if ((op & 0xFE0F) == 0x920C) {                          // ST X, Rr
         rr = (op>>4)&0x1F; uint16_t x = g_dmem[0x1A] | (g_dmem[0x1B]<<8);
@@ -534,21 +718,21 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
         writeDmem(x, g_dmem[rr]); x++; g_dmem[0x1A] = x&0xFF; g_dmem[0x1B] = (x>>8)&0xFF; cy = 2;
     }
     else if ((op & 0xFE0F) == 0x9209) {                          // ST Y+, Rr
-        rr = (op>>4)&0x1F; uint16_t y = g_dmem[0x18] | (g_dmem[0x19]<<8);
-        writeDmem(y, g_dmem[rr]); y++; g_dmem[0x18] = y&0xFF; g_dmem[0x19] = (y>>8)&0xFF; cy = 2;
+        rr = (op>>4)&0x1F; uint16_t y = g_dmem[0x1C] | (g_dmem[0x1D]<<8);
+        writeDmem(y, g_dmem[rr]); y++; g_dmem[0x1C] = y&0xFF; g_dmem[0x1D] = (y>>8)&0xFF; cy = 2;
     }
     else if ((op & 0xFE0F) == 0x920A) {                          // ST -Y, Rr
-        rr = (op>>4)&0x1F; uint16_t y = (g_dmem[0x18] | (g_dmem[0x19]<<8)) - 1;
-        g_dmem[0x18] = y&0xFF; g_dmem[0x19] = (y>>8)&0xFF; writeDmem(y, g_dmem[rr]); cy = 2;
+        rr = (op>>4)&0x1F; uint16_t y = (g_dmem[0x1C] | (g_dmem[0x1D]<<8)) - 1;
+        g_dmem[0x1C] = y&0xFF; g_dmem[0x1D] = (y>>8)&0xFF; writeDmem(y, g_dmem[rr]); cy = 2;
     }
     else if ((op & 0xFE0F) == 0x920E) {                          // ST -Z, Rr
-        rr = (op>>4)&0x1F; uint16_t z = (g_dmem[0x1A] | (g_dmem[0x1B]<<8)) - 1;
-        g_dmem[0x1A] = z&0xFF; g_dmem[0x1B] = (z>>8)&0xFF; writeDmem(z, g_dmem[rr]); cy = 2;
+        rr = (op>>4)&0x1F; uint16_t z = (g_dmem[0x1E] | (g_dmem[0x1F]<<8)) - 1;
+        g_dmem[0x1E] = z&0xFF; g_dmem[0x1F] = (z>>8)&0xFF; writeDmem(z, g_dmem[rr]); cy = 2;
     }
     else if ((op & 0xD200) == 0x8200) {                          // STD Y+q / Z+q, Rr
         rr = (op>>4)&0x1F; int q = ((op&0x2000)>>8) | ((op&0x0C00)>>7) | (op&7);
-        if (op & 8) { uint16_t y = g_dmem[0x18] | (g_dmem[0x19]<<8); writeDmem(y + q, g_dmem[rr]); }
-        else        { uint16_t z = g_dmem[0x1A] | (g_dmem[0x1B]<<8); writeDmem(z + q, g_dmem[rr]); }
+        if (op & 8) { uint16_t y = g_dmem[0x1C] | (g_dmem[0x1D]<<8); writeDmem(y + q, g_dmem[rr]); }
+        else        { uint16_t z = g_dmem[0x1E] | (g_dmem[0x1F]<<8); writeDmem(z + q, g_dmem[rr]); }
         cy = 2;
     }
     else if ((op & 0xFE0F) == 0x920F) {                          // PUSH
@@ -743,9 +927,9 @@ static std::string decodeOp(uint16_t op) {
 static void snapPrev() {
     g_prev.clear();
     for (int i = 0; i < 32; i++) g_prev[fmt("R%d", i)] = g_dmem[i];
-    for (int i = 0; i < 3; i++) {
-        g_prev[fmt("DDR%s", g_pname[i])] = g_dmem[0x20 + g_pio[i].ddr];
-        g_prev[fmt("PORT%s", g_pname[i])] = g_dmem[0x20 + g_pio[i].port];
+    for (int i = 0; i < (int)g_pio.size(); i++) {
+        g_prev[fmt("DDR%s", g_pname[i].c_str())] = g_dmem[0x20 + g_pio[i].ddr];
+        g_prev[fmt("PORT%s", g_pname[i].c_str())] = g_dmem[0x20 + g_pio[i].port];
     }
     g_prevValid = true;
 }
@@ -795,15 +979,15 @@ static void renderDash() {
         wr(line, anyCh?RED:GRAY);
     }
     wr("--------------------------------------------------------------------------------", DCYAN);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < (int)g_pio.size(); i++) {
         uint8_t ddr = g_dmem[0x20+g_pio[i].ddr], prt = g_dmem[0x20+g_pio[i].port];
         uint8_t pin = readDmem(0x20+g_pio[i].pin);
         char ddrb[16], prtb[16], pinb[16];
         for (int b = 0; b < 8; b++) { ddrb[7-b] = ((ddr>>b)&1)+'0'; prtb[7-b] = ((prt>>b)&1)+'0'; pinb[7-b] = ((pin>>b)&1)+'0'; }
         ddrb[8] = prtb[8] = pinb[8] = 0;
-        bool ch = g_prevValid && g_prev.count(fmt("DDR%s", g_pname[i])) && g_prev[fmt("DDR%s", g_pname[i])] != ddr;
+        bool ch = g_prevValid && g_prev.count(fmt("DDR%s", g_pname[i].c_str())) && g_prev[fmt("DDR%s", g_pname[i].c_str())] != ddr;
         wr(fmt(" [PORT%s] DDR%s: 0b%s (0x%02X) | PORT%s: 0b%s (0x%02X) | PIN%s: 0b%s (0x%02X)",
-               g_pname[i], g_pname[i], ddrb, ddr, g_pname[i], prtb, prt, g_pname[i], pinb, pin),
+               g_pname[i].c_str(), g_pname[i].c_str(), ddrb, ddr, g_pname[i].c_str(), prtb, prt, g_pname[i].c_str(), pinb, pin),
             ch ? RED : GRAY);
     }
     if (!g_watch.empty()) {
@@ -829,8 +1013,8 @@ static int runSelfTest() {
     };
     wr("-- Emulator self-test (LDI/ADD/SUBI/SBIW + flags)", CYAN);
     static const uint8_t prog[] = {0x05,0xE5, 0x13,0xE0, 0x01,0x0F, 0x00,0x56, 0x82,0xE3, 0xC2,0x97};
-    memset(g_flash, 0xFF, sizeof(g_flash));
-    memcpy(g_flash, prog, sizeof(prog));
+    g_flash.assign(FLASH_END, 0xFF);
+    memcpy(g_flash.data(), prog, sizeof(prog));
     std::fill(g_dmem.begin(), g_dmem.end(), 0);
     g_dmem[0x5D] = RAM_END & 0xFF; g_dmem[0x5E] = (RAM_END>>8)&0xFF;
     g_loaded = true; g_pc = 0; g_cycles = 0; g_f = {};
@@ -873,7 +1057,7 @@ static int runSelfTest2() {
         0x98,0x01,   // MOVW R18:19 <- R16:17
         0x8F,0xE0,   // LDI R24,15
         0x80,0x9F,   // MUL R24,R16 -> R1:R0 = 15*255 = 0x0EF1
-        0x00,0x93,   // STS 0x61, R0
+        0x00,0x92,   // STS 0x61, R0
         0x61,0x00,
         0x40,0x91,   // LDS R20, 0x61 -> 0xF1
         0x61,0x00,
@@ -882,31 +1066,29 @@ static int runSelfTest2() {
         0x12,0x82,   // STD Z+2, R1  -> [0x62] = 0x0E
         0x51,0x81,   // LDD R21, Z+1 <- [0x61] = 0xF1
         0x62,0x81 }; // LDD R22, Z+2 <- [0x62] = 0x0E
-    memset(g_flash, 0xFF, sizeof(g_flash));
-    memcpy(g_flash, prog, sizeof(prog));
+    g_flash.assign(FLASH_END, 0xFF);
+    memcpy(g_flash.data(), prog, sizeof(prog));
     std::fill(g_dmem.begin(), g_dmem.end(), 0);
     g_dmem[0x5D] = RAM_END & 0xFF; g_dmem[0x5E] = (RAM_END>>8)&0xFF;
     g_loaded = true; g_pc = 0; g_cycles = 0; g_f = {};
 
     uint16_t op; int cy;
-    for (int i = 0; i < 6; i++) { execOne(op, cy); wr(fmt("  dbg pc=0x%04X op=0x%04X %s", g_pc, op, decodeOp(op).c_str()), CYAN); }
+    for (int i = 0; i < 6; i++) execOne(op, cy);          // LDI..SBRS (skips w6)
     tc("SEC (BSET0) C=1", g_f.C, 1);
     tc("BST R16,3 -> T=1", g_f.T, 1);
     tc("BLD R17,5 -> 0x20", g_dmem[17], 0x20);
     tc("SBRS skipped LDI (R18=0)", g_dmem[18], 0);
     execOne(op, cy);                                     // MOVW
-    wr(fmt("  dbg pc=0x%04X op=0x%04X R0=0x%02X R1=0x%02X [0x60]=0x%02X [0x61]=0x%02X [0x62]=0x%02X", g_pc, op, g_dmem[0], g_dmem[1], g_dmem[0x60], g_dmem[0x61], g_dmem[0x62]), CYAN);
     tc("MOVW R18 = 0xFF", g_dmem[18], 0xFF);
     tc("MOVW R19 = 0x20", g_dmem[19], 0x20);
     execOne(op, cy); execOne(op, cy);                    // LDI R24, MUL
     tc("MUL R0 = 0xF1", g_dmem[0], 0xF1);
     tc("MUL R1 = 0x0E", g_dmem[1], 0x0E);
     execOne(op, cy);                                     // STS 0x61, R0
-    wr(fmt("  dbg STS: pc=0x%04X op=0x%04X R0=0x%02X [0x61]=0x%02X", g_pc, op, g_dmem[0], g_dmem[0x61]), CYAN);
     execOne(op, cy);                                     // LDS R20
-    wr(fmt("  dbg LDS: pc=0x%04X op=0x%04X R20=0x%02X kk-PC-th word test", g_pc, op, g_dmem[20]), CYAN);
     tc("LDS/STS R20 = 0xF1", g_dmem[20], 0xF1);
-    execOne(op, cy); execOne(op, cy);                    // Z = 0x60 (LDI R30/R31)
+    execOne(op, cy);
+    execOne(op, cy);                                     // Z = 0x60 (LDI R30/R31)
     execOne(op, cy);                                     // STD Z+2, R1
     tc("STD [0x62] = 0x0E", g_dmem[0x62], 0x0E);
     execOne(op, cy);                                     // LDD R21, Z+1
@@ -939,6 +1121,32 @@ static int parseNum(const std::string& s, bool& ok) {
     return neg ? -(int)v : (int)v;
 }
 
+// ---------------------------------------------------------------------
+// Shared runner: executes until a user bp / temp bp / maxCycles.
+// Returns: 0=hit user bp, 1=hit temp bp, -1=stopped (max/EOF)
+// ---------------------------------------------------------------------
+static int runUntil(uint64_t maxC, const char* tag) {
+    uint64_t cnt = 0;
+    g_running = true;
+    while (cnt < maxC && g_running) {
+        if (!g_bpTemp.empty() && g_bpTemp.count(g_pc)) {
+            wr(fmt("-- %s at PC=0x%04X (cycle %llu)", tag, g_pc, (unsigned long long)g_cycles), GREEN);
+            g_running = false; return 1;
+        }
+        auto bi = g_bp.find(g_pc);
+        if (bi != g_bp.end()) {
+            wr(fmt("-- Breakpoint #%d hit at PC=0x%04X (cycle %llu)", bi->second, g_pc, (unsigned long long)g_cycles), RED);
+            g_running = false; return 0;
+        }
+        uint16_t op; int cy;
+        if (!execOne(op, cy)) break;
+        cnt++;
+    }
+    g_running = false;
+    return -1;
+}
+
+
 static bool dispatch(const std::string& line) {
     auto tk = splitWs(line);
     if (tk.empty()) return true;
@@ -969,26 +1177,143 @@ static bool dispatch(const std::string& line) {
     if (cmd == "reset" || cmd == "rst") {
         g_pc = 0; g_cycles = 0; g_running = false;
         std::fill(g_dmem.begin(), g_dmem.end(), 0);
-        for (int i = 0; i < 3; i++) { g_ext[i].mask = 0; g_ext[i].level = 0; }
+        for (int i = 0; i < (int)g_pio.size(); i++) { g_ext[i].mask = 0; g_ext[i].level = 0; }
         g_dmem[0x5D] = RAM_END & 0xFF; g_dmem[0x5E] = (RAM_END>>8)&0xFF;
         snapPrev(); renderDash(); wr("Reset done.", GREEN); return true;
     }
-    if (cmd == "stepi" || cmd == "si" || cmd == "step" || cmd == "s") {
+    if (cmd == "stepi" || cmd == "si") {
         int n = 1;
         if (!a(1).empty()) { bool ok; n = parseNum(a(1), ok); if (!ok) n = 1; }
-        snapPrev();
+        if (!g_loaded) { wr("! No program loaded. Use: load <elf>", RED); return true; }
         snapPrev();
         for (int i = 0; i < n; i++) {
             uint16_t op; int cy;
             if (!execOne(op, cy)) break;
             renderDash();
-            Sleep(60);
         }
+        return true;
+    }
+    // Line-step (README sec.12: next = "over" a C;line; step = to the next line,
+    // entering functions). Implemented EXACTLY through the DWARF .debug_line
+    // table parsed from the ELF. Without -g: fallback (over call / 1 instr).
+    if (cmd == "step" || cmd == "s" || cmd == "next" || cmd == "n") {
+        if (!g_loaded) { wr("! No program loaded. Use: load <elf>", RED); return true; }
+        int n = 1;
+        if (!a(1).empty()) { bool ok; n = parseNum(a(1), ok); if (!ok) n = 1; }
+        bool over = (cmd == "next" || cmd == "n");
+        g_bpTemp.clear(); snapPrev();
+        if (!g_hasLines) wr("(ELF without -g: line mode unavailable, instruction fallback)", YELLOW);
+        for (int i = 0; i < n; i++) {
+            uint32_t trg = 0; bool lineMode = false;
+            if (g_hasLines) {
+                int L = lineOfAddr(g_pc * 2u);
+                if (L > 0) {
+                    uint32_t nb = nextLineAddr(g_pc * 2u);
+                    if (nb) { trg = nb / 2u; lineMode = true; }
+                }
+            }
+            if (lineMode) {
+                if (over) {                                  // do not enter the call
+                    uint16_t cur = flashWord(g_pc);
+                    if (isCallOp(cur)) {
+                        uint16_t tPC = (uint16_t)(g_pc + isCall2Word(cur));
+                        g_bpTemp[tPC] = 1;
+                        runUntil(10000000, "Step over");
+                        g_bpTemp.clear();
+                        continue;
+                    }
+                }
+                g_bpTemp[trg] = 1;
+                runUntil(10000000, over ? "Next line" : "Step into");
+                g_bpTemp.clear();
+            } else {
+                uint16_t cur = flashWord(g_pc);
+                if (over && isCallOp(cur)) {
+                    uint16_t tPC = (uint16_t)(g_pc + isCall2Word(cur));
+                    g_bpTemp[tPC] = 1;
+                    runUntil(10000000, "Step over");
+                    g_bpTemp.clear();
+                } else {
+                    uint16_t op; int cy;
+                    if (!execOne(op, cy)) break;
+                }
+            }
+            renderDash();
+        }
+        return true;
+    }
+    // finish (fin): run until the current subroutine returns (SP returns to entry level)
+    if (cmd == "finish" || cmd == "fin") {
+        if (!g_loaded) { wr("! No program loaded. Use: load <elf>", RED); return true; }
+        uint16_t spEntry = g_dmem[0x5D] | (g_dmem[0x5E]<<8);
+        if (g_bpTemp.count(g_pc)) { g_bpTemp.clear(); }
+        snapPrev();
+        wr(fmt("-- finish: from PC=0x%04X, SP_entry=0x%04X", g_pc, spEntry), CYAN);
+        uint64_t cnt = 0; g_running = true;
+        bool below = false; bool hitRet = false;
+        while (g_running && cnt < 50000000) {
+            auto bi = g_bp.find(g_pc);
+            if (bi != g_bp.end()) { wr(fmt("-- Breakpoint #%d hit at PC=0x%04X", bi->second, g_pc), RED); g_running=false; break; }
+            uint16_t op; int cy;
+            if (!execOne(op, cy)) break;
+            cnt++;
+            uint16_t spNow = g_dmem[0x5D] | (g_dmem[0x5E]<<8);
+            hitRet = (op == 0x9508 || op == 0x9518);
+            if (spNow < spEntry) { below = true; }
+            else if (below || (hitRet && spNow >= spEntry)) {
+                wr(fmt("-- Returned from subroutine at PC=0x%04X (cycle %llu)", g_pc, (unsigned long long)g_cycles), GREEN);
+                g_running=false; break;
+            }
+        }
+        g_running = false;
+        if (cnt >= 50000000) wr("-- finish: max-cycles limit hit.", YELLOW);
+        renderDash();
+        return true;
+    }
+    // until (u): run to line / address / symbol (temporary breakpoint).
+    // A plain decimal number = SOURCE LINE when the ELF has debug info
+    // (README sec.12), otherwise = word address. '0x..': always address.
+    if (cmd == "until" || cmd == "u") {
+        if (!g_loaded) { wr("! No program loaded. Use: load <elf>", RED); return true; }
+        std::string tgt = a(1);
+        if (tgt.empty()) {
+            wr(g_hasLines
+                ? "Usage: until <line | 0xaddr | symbol>   (e.g. until 34 / until main)"
+                : "Usage: until <0xaddr | symbol>   (rebuild with -g for line support)", RED);
+            return true;
+        }
+        uint32_t n = 0; bool ok = false; bool asLine = false; int lnVal = 0;
+        bool hexLike = (tgt.size() > 1 && (tgt[1] == 'x' || tgt[1] == 'X'));
+        if ((isdigit((unsigned char)tgt[0]) || tgt[0]=='0') && !hexLike && g_hasLines) {
+            bool isNum; int ln = parseNum(tgt, isNum);
+            if (isNum && ln >= 1) {
+                uint32_t ba = firstAddrOfLine(ln);
+                if (ba) { n = ba / 2u; ok = true; asLine = true; lnVal = ln; }
+            }
+        }
+        if (!ok && !asLine && (isdigit((unsigned char)tgt[0]) || tgt[0]=='0')) {
+            n = (uint32_t)parseNum(tgt, ok);
+        }
+        uint32_t sym = 0;
+        if (!ok && findSymbol(tgt, sym)) { n = sym / 2; ok = true; }
+        if (!ok) {
+            wr(fmt("until: cannot resolve '%s' (line needs -g in the ELF; %s)",
+                   tgt.c_str(), g_hasLines ? "always '0x' for addresses" : "no debug lines found"),
+               RED);
+            return true;
+        }
+        if (asLine) wr(fmt("-- until: line %d -> PC=0x%04X", lnVal, (uint16_t)n), DCYAN);
+        uint16_t pc = (uint16_t)n;
+        g_bpTemp[pc] = 1; snapPrev();
+        int res = runUntil(50000000, "Run to");
+        g_bpTemp.clear();
+        if (res != 1) wr(fmt("-- until: target PC=0x%04X not reached (max-cycles).", pc), YELLOW);
+        renderDash();
         return true;
     }
     if (cmd == "run" || cmd == "r") {
         if (!g_loaded) { wr("! No program loaded. Use: emu start", RED); return true; }
-        uint64_t maxC = 2000000;
+        uint64_t maxC = 100000000;   // ~12.5 s of program time at 8 MHz (one _delay_ms(500) = 4M cycles)
         if (!a(1).empty()) { bool ok; long v = parseNum(a(1), ok); if (ok) maxC = (uint64_t)v; }
         g_running = true;
         uint64_t cnt = 0;
@@ -1011,10 +1336,17 @@ static bool dispatch(const std::string& line) {
         std::string s1 = lower(a(1));
         if (s1 == "all" || s1.empty()) {
             for (int i = 0; i < 32; i++) wr(fmt(" R%02d = 0x%02X (%d)", i, g_dmem[i], g_dmem[i]));
-        } else if (s1[0] == 'r' || s1[0] == 'R') {
+        } else if (s1[0] == 'r') {
             bool ok; int idx = parseNum(s1.substr(1), ok);
             if (ok && idx >= 0 && idx < 32) {
-                if (!a(2).empty()) { bool ok2; int v = parseNum(a(2), ok2); if (ok2) g_dmem[idx] = (uint8_t)(v & 0xFF); }
+                // assign syntaxes: reg R16 = 0x55 | reg R16 0x55 | reg R16 = -25
+                std::string valTok = a(2);
+                if (valTok == "=" && !a(3).empty()) valTok = a(3);
+                if (!valTok.empty()) {
+                    bool ok2; int v = parseNum(valTok, ok2);
+                    if (ok2) { g_dmem[idx] = (uint8_t)(v & 0xFF); wr(fmt(" R%02d := 0x%02X", idx, (uint8_t)v), GREEN); }
+                    else wr(fmt(" ! Bad value: %s", valTok.c_str()), RED);
+                }
                 int v = g_dmem[idx];
                 wr(fmt(" R%02d = 0x%02X unsigned %d signed %d", idx, v, v, (int8_t)v), CYAN);
             } else wr("Register index out of range (R0..R31)", RED);
@@ -1025,8 +1357,13 @@ static bool dispatch(const std::string& line) {
     }
     if (cmd == "port" || cmd == "pt") {
         std::string p = upper(a(1));
-        int pi = (p == "B") ? 0 : (p == "C") ? 1 : (p == "D") ? 2 : -1;
-        if (pi < 0) { wr("Usage: port <B|C|D>", RED); return true; }
+        int pi = portIndex(p.empty() ? '\0' : p[0]);
+        if (pi < 0) {
+            std::string av; for (size_t k = 0; k < g_pname.size(); k++) { av += g_pname[k]; if (k+1 < g_pname.size()) av += "|"; }
+            if (av.empty()) av = "<none>";
+            wr("Usage: port <" + av + ">   (chip " + g_chip + " has these ports)", RED);
+            return true;
+        }
         if (g_quiet) return true;
         uint8_t ddr = g_dmem[0x20+g_pio[pi].ddr], prt = g_dmem[0x20+g_pio[pi].port];
         uint8_t pin = readDmem(0x20+g_pio[pi].pin);
@@ -1042,7 +1379,7 @@ static bool dispatch(const std::string& line) {
     if (cmd == "pin" || cmd == "pn") {
         std::string pn = upper(a(1)), val = lower(a(2));
         if (pn.size() >= 2 && (pn[0] == 'P')) {
-            int pi = (pn[1] == 'B') ? 0 : (pn[1] == 'C') ? 1 : (pn[1] == 'D') ? 2 : -1;
+            int pi = portIndex(pn[1]);
             if (pi < 0) { wr("Unknown port (B/C/D on atmega8)", RED); return true; }
             bool isBit = (pn.size() >= 3) && isdigit((unsigned char)pn[2]) && pn.size() == 3;
             uint8_t cur = g_ext[pi].mask ? g_ext[pi].level : 0;
@@ -1065,6 +1402,32 @@ static bool dispatch(const std::string& line) {
     }
     if (cmd == "mem" || cmd == "m") {
         std::string region = lower(a(1));
+        if (region.empty()) { wr("Usage: mem <sram|flash> <addr> [len]   |   write: mem sram 0x60 = 0xFF", RED); return true; }
+        if (region == "eeprom") { wr(" EEPROM is not emulated (no writes/reads).", YELLOW); return true; }
+        // write mode: "mem sram 0x60 = 0xFF  [0x33]"
+        for (int t = 2; t <= 6; t++) {
+            if (a(t) == "=" && !a(t+1).empty()) {
+                bool okA, okV; uint32_t wa = parseNum(a(t-1), okA); int v = parseNum(a(t+1), okV);
+                if (!okA || !okV) { wr(" ! Bad address/value in mem write.", RED); return true; }
+                if (region == "sram") {
+                    writeDmem((int)wa, (uint8_t)(v & 0xFF));
+                    wr(fmt(" SRAM 0x%04X := 0x%02X", wa, (uint8_t)v), GREEN);
+                } else if (region == "flash") {
+                    if (wa < FLASH_END) { g_flash[wa] = (uint8_t)(v & 0xFF); wr(fmt(" FLASH 0x%04X := 0x%02X", wa, (uint8_t)v), GREEN); }
+                    else wr(" ! Flash address out of range.", RED);
+                }
+                // optional second assignment
+                if (!a(t+3).empty()) {
+                    bool okV2; int v2 = parseNum(a(t+3), okV2);
+                    if (okV2) {
+                        if (region == "sram") { writeDmem((int)wa+1, (uint8_t)(v2 & 0xFF)); wr(fmt(" SRAM 0x%04X := 0x%02X", wa+1, (uint8_t)v2), GREEN); }
+                        else if (wa+1 < FLASH_END) { g_flash[wa+1] = (uint8_t)(v2 & 0xFF); wr(fmt(" FLASH 0x%04X := 0x%02X", wa+1, (uint8_t)v2), GREEN); }
+                    }
+                    t += 2;
+                }
+                return true;
+            }
+        }
         bool ok; uint32_t addr = a(2).empty() ? 0 : parseNum(a(2), ok);
         int len = 16; if (!a(3).empty()) { bool ok3; len = parseNum(a(3), ok3); }
         for (int i = 0; i < len; i += 8, addr += 8) {
@@ -1080,22 +1443,42 @@ static bool dispatch(const std::string& line) {
         return true;
     }
     if (cmd == "w" || cmd == "watch") {
-        if (!a(1).empty()) { bool ok; int v = parseNum(a(1), ok);
-            if (ok) { g_watch.push_back({a(1), (uint16_t)v}); wr(fmt("Watch added: addr 0x%04X", v), GREEN); } }
+        std::string t = a(1);
+        if (!t.empty()) {
+            bool ok; int v = parseNum(t, ok);
+            if (!ok) { uint32_t sym = 0; if (findSymbol(t, sym)) { v = (int)(sym & 0xFFFF); ok = true; } }
+            if (ok) { g_watch.push_back({t, (uint16_t)v}); wr(fmt("Watch added: %s @ 0x%04X", t.c_str(), v), GREEN); }
+            else wr(fmt(" ! Watch: cannot resolve '%s' (variable or address expected).", t.c_str()), RED);
+        } else wr("Usage: watch <variable | sram-addr>   (watch off - Wenzel)", RED);
         return true;
     }
     if (cmd == "bp") {
         std::string s1 = lower(a(1));
         if (s1 == "add" || s1 == "ba") {
-            uint32_t addr = 0; bool ok = false;
+            uint32_t addr = 0; bool ok = true;
             uint16_t pc = 0xFFFF;
-            if (!a(2).empty() && isdigit((unsigned char)a(2)[0])) {
-                bool o2; addr = parseNum(a(2), o2); ok = o2; pc = addr;
-                // addresses may be byte addresses: treat < FLASH_END as word index directly
-            } else if (!a(2).empty()) {
-                uint32_t sym = 0;
-                if (findSymbol(a(2), sym)) { ok = true; pc = (uint16_t)(sym / 2); }
-                else wr(fmt("bp add: cannot resolve symbol '%s'", a(2).c_str()), RED);
+            if (a(2).empty()) ok = false;
+            else {
+                std::string t = a(2);
+                bool hexLike = (t.size() > 1 && (t[1] == 'x' || t[1] == 'X'));
+                bool asLine = false;
+                if (!hexLike && isdigit((unsigned char)t[0]) && g_hasLines) {
+                    bool isNum; int ln = parseNum(t, isNum);
+                    if (isNum && ln >= 1) {
+                        uint32_t ba = firstAddrOfLine(ln);
+                        if (ba) { pc = (uint16_t)(ba / 2u); ok = true; asLine = true;
+                                  wr(fmt("-- bp: line %d -> PC=0x%04X", ln, pc), DCYAN); }
+                    }
+                }
+                if (!asLine) {
+                    if (isdigit((unsigned char)t[0]) || t[0]=='0') {
+                        bool o2; addr = parseNum(t, o2); ok = o2; pc = addr;   // word address
+                    } else {
+                        uint32_t sym = 0;
+                        if (findSymbol(t, sym)) { ok = true; pc = (uint16_t)(sym / 2); }
+                        else { ok = false; wr(fmt("bp add: cannot resolve symbol '%s'", t.c_str()), RED); }
+                    }
+                }
             }
             if (ok && pc != 0xFFFFu) {
                 g_bp[pc] = (int)g_bpSerial++; wr(fmt("Breakpoint #%d at PC=0x%04X", g_bpSerial-1, pc), GREEN);
@@ -1151,13 +1534,18 @@ static bool dispatch(const std::string& line) {
     if (cmd == "selftest2" || cmd == "st2") { runSelfTest2(); return true; }
     if (cmd == "quiet") { g_quiet = true; return true; }
     if (cmd == "help" || cmd == "?") {
-        wr("Commands (from README sec.12):", CYAN);
-        wr("  emu start|load|reset    build info shown as 'emu' section");
-        wr("  step|stepi [n]          auto/until/run [maxcyc]");
-        wr("  reg [R#|sreg|all] [=val] port <B|C|D>   pin <P#|P#bit> <v|toggle>");
-        wr("  mem <sram|flash> <addr> [len]    ba <addr|symbol>   bl  bd <n|all>");
-        wr("  tr (timer reset)  size  da (disasm)  w <addr> (watch)  silent ");
-        wr("  silent  quiet  help  selftest  selftest2  quit");
+        wr("Commands (README sec.12 + ext):", CYAN);
+        wr("  load <elf> | reset(rst)            - load/reset program");
+        wr("  run(r) [maxcyc] | auto(au) [period]");
+        wr("  stepi(si) [n] | step(s) [n] | next(n) [n]   - step instructions / over calls");
+        wr("  finish(fin) | until(u) <addr|sym>  - run-to-return / run-to-target");
+        wr("  reg R# [= val] | sreg | all        - read/assign registers");
+        wr("  port <A|B|C|D>                     - port pins report (IN/OUT/PullUp)");
+        wr("  pin <P#|P#bit> <v|toggle>          - stimulus");
+        wr("  mem sram|flash <addr> [len]        - dump; write: mem sram 0x60 = 0xFF");
+        wr("  bp add|ba <addr|sym>  list|bl  del|bd <n|all>");
+        wr("  w <var|addr> (watch)   tr (timer reset)   sz size   da (disasm)");
+        wr("  selftest | selftest2 | quiet | quit(q)");
         return true;
     }
     wr("Unknown command: " + cmd + ". Type 'help'.", RED);
