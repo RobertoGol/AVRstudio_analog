@@ -140,6 +140,19 @@ static uint64_t parseAddr(const std::string& sv) {
     return strtoull(v.c_str(), nullptr, 0);   // handles 0xNN and decimal
 }
 
+// SPM state (used by loadEnv below; implementation near execOne)
+static uint16_t g_spmPageSize = 64;                 // SPM_PAGESIZE (bytes), from the profile
+static uint8_t  g_sig[3] = { 0x1E, 0x93, 0x07 };    // device signature (profile)
+static std::vector<uint8_t> g_pagebuf;              // page buffer (g_spmPageSize bytes)
+
+static void spmInit() {
+    if (g_spmPageSize < 2) g_spmPageSize = 64;
+    if (g_spmPageSize & (g_spmPageSize - 1)) {      // force power of two
+        uint16_t p = 2; while (p * 2 <= g_spmPageSize) p *= 2; g_spmPageSize = p;
+    }
+    g_pagebuf.assign(g_spmPageSize, 0xFF);
+}
+
 static void loadEnv() {
     auto cfg = readPairs(g_root + "/echo.ctos");
     auto it  = [&cfg](const char* k){ auto i = cfg.find(k); return i!=cfg.end()? i->second : std::string(); };
@@ -157,6 +170,17 @@ static void loadEnv() {
     if (!re.empty()) { uint64_t v = parseAddr(re); if (v >= 64 && v <= 64*1024) { RAM_END = (uint16_t)v; DMEM_SIZE = RAM_END + 1; g_dmem.assign(DMEM_SIZE, 0); } }
     std::string ee = pit("eepromend");
     if (!ee.empty()) { uint64_t v = parseAddr(ee); if (v >= 16 && v <= 8192) g_eeprom.assign((size_t)v + 1, 0xFF); }   // EepromEnd = SIZE-1
+    std::string ps = pit("spmpagesize");
+    if (!ps.empty()) { uint64_t v = parseAddr(ps); if (v >= 2 && v <= 4096) g_spmPageSize = (uint16_t)v; }
+    spmInit();
+    std::string sg = pit("signature");
+    if (!sg.empty()) {
+        // "0x1E 0x93 0x07"
+        unsigned b0=0,b1=0,b2=0;
+        if (sscanf(sg.c_str(), "%x %x %x", &b0,&b1,&b2) == 3 && b1 < 256 && b2 < 256) {
+            g_sig[0]=(uint8_t)b0; g_sig[1]=(uint8_t)b1; g_sig[2]=(uint8_t)b2;
+        }
+    }
     // [Ports]: single-letter keys "B = PIN_IO DDR_IO PORT_IO"
     std::vector<Pio> np; std::vector<std::string> nn;
     for (auto& kv : p) {                                   // map sorted: A,B,C,D order
@@ -501,6 +525,45 @@ static void setChipFlag(int s, int v) {
 }
 static uint16_t flashWord(int w) { int o = w*2; return (uint16_t)(g_flash[o] | (g_flash[o+1]<<8)); }
 
+// ---------------------------------------------------------------------
+// SPM - Flash self-programming (README/Techn.md parity). Avr-libc
+// sequence: buffer via SPMEN, erase via PGERS+SPMEN, commit via PGWRT+SPMEN;
+// BLBSET+SPMEN reads a signature byte into R0.
+// ---------------------------------------------------------------------
+
+static void doSpm() {
+    if (g_pagebuf.empty()) spmInit();
+    uint8_t cr = readDmem(0x20 + 0x37);            // SPMCR/SPMCSR
+    uint16_t z = (uint16_t)(g_dmem[30] | (g_dmem[31] << 8));
+    bool acted = false;
+    if (cr & 0x01) {                                // SPMEN: stage R1:R0 word (or read sig on BLBSET)
+        if (cr & 0x08) {                            // BLBSET -> signature byte into R0
+            g_dmem[0] = (z == 1) ? g_sig[1] : (z == 2) ? g_sig[2] : g_sig[0];
+        } else {
+            uint16_t off = (uint16_t)(z & (g_spmPageSize - 1));
+            if ((off & 1) == 0) { g_pagebuf[off] = g_dmem[0]; g_pagebuf[off+1] = g_dmem[1]; }
+        }
+        acted = true;
+    }
+    if ((cr & 0x01) && (cr & 0x02)) {               // PGERS + SPMEN: erase whole page
+        uint32_t pg = (z - (z & (g_spmPageSize - 1)));
+        if (pg + g_spmPageSize <= FLASH_END) {
+            for (uint32_t i = 0; i < g_spmPageSize; i++) g_flash[pg + i] = 0xFF;
+        }
+        acted = true;
+    }
+    if ((cr & 0x01) && (cr & 0x04)) {               // PGWRT + SPMEN: commit page buffer
+        uint32_t pg = (z - (z & (g_spmPageSize - 1)));
+        for (uint32_t i = 0; i < g_spmPageSize && pg + i < FLASH_END; i++)
+            g_flash[pg + i] = g_pagebuf[i];
+        acted = true;
+    }
+    if (acted) {
+        // SPMEN/PGERS/PGWRT are self-clearing in emulation (operation completes instantly)
+        writeDmem(0x20 + 0x37, cr & 0xF0);
+    }
+}
+
 // returns false on failure / stop. Sets opOut, cyOut
 static bool execOne(uint16_t& opOut, int& cyOut) {
     if (!g_loaded) { wr("! No program loaded. Use: emu start", RED); return false; }
@@ -790,6 +853,7 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
         int r = (v>>1) | ((cin<<7)&0x80);
         g_dmem[rd] = (uint8_t)r; setShiftFlags(r, cout);
     }
+    else if (op == 0x95E8) { doSpm(); cy = 2; }                  // SPM (before BSET mask: 0x95E8&0xFF0F==0x9408!)
     else if ((op & 0xFF0F) == 0x9408) {                          // BSET s (SEC/SEZ/SEN/...)
         setChipFlag((op>>4)&7, 1);
     }
@@ -866,6 +930,7 @@ static std::string decodeOp(uint16_t op) {
         static const char* fn[8] = {"C","Z","N","V","S","H","T","I"};
         snprintf(b, sizeof b, "%s%s (flag %s)", (op&0xFF0F)==0x9408?"SE":"CL", fn[(op>>4)&7], fn[(op>>4)&7]); return b;
     }
+    if (op == 0x95E8) return "SPM";
     if (op == 0x9588) return "SLEEP";
     if (op == 0x95A8) return "WDR";
     if (op == 0x9698) return "BREAK";
@@ -897,8 +962,8 @@ static std::string decodeOp(uint16_t op) {
         case 0xE000: snprintf(b, sizeof b, "LDI  R%u, 0x%02X", d+16, (op&0xF)|((op>>4)&0xF0)); return b;
         case 0xC000: snprintf(b, sizeof b, "RJMP 0x%04X", g_pc + 1 + (op&0xFFF)); return b;
         case 0xD000: snprintf(b, sizeof b, "RCALL 0x%04X", g_pc + 1 + (op&0xFFF)); return b;
-        case 0xB000: snprintf(b, sizeof b, "IN   R%u, 0x%02X", (op>>4)&0x1F, (op&0xF)|((op>>8)&3)<<4); return b;
-        case 0xB800: snprintf(b, sizeof b, "OUT  0x%02X, R%u", (op&0xF)|((op>>8)&3)<<4, (op>>4)&0x1F); return b;
+        case 0xB000: if (op & 0x0800) snprintf(b, sizeof b, "OUT  0x%02X, R%u", (op&0xF)|((op>>8)&3)<<4, (op>>4)&0x1F);
+                     else            snprintf(b, sizeof b, "IN   R%u, 0x%02X", (op>>4)&0x1F, (op&0xF)|((op>>8)&3)<<4); return b;
         case 0xF000: {                                            // BRBS/BRBC + aliases
             static const char* nB[8] = {"BRCS","BREQ","BRMI","BRVS","BRGE","BRHS","BRTS","BRIE"};
             static const char* nC[8] = {"BRCC","BRNE","BRPL","BRVC","BRLT","BRHC","BRTC","BRID"};
@@ -1445,12 +1510,12 @@ static bool dispatch(const std::string& line) {
                     if (rSet(wai, (uint8_t)v)) { wr(fmt(" %s 0x%04X := 0x%02X", upper(region).c_str(), wai, (uint8_t)v), GREEN); }
                     else { wr(fmt(" ! %s address 0x%04X out of range.", upper(region).c_str(), wai), RED); }
                     written++;
-                    bool hasNext = (written == 1) && !a(t+3).empty();
+                    bool hasNext = (written == 1) && !a(t+2).empty();
                     if (!hasNext) break;
-                    bool okV2; int v2 = parseNum(a(t+3), okV2);
+                    bool okV2; int v2 = parseNum(a(t+2), okV2);
                     if (!okV2) break;
                     v = v2; wai++;
-                    t += 2;
+                    t += 1;
                 }
                 return true;
             }

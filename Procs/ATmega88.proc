@@ -8,6 +8,7 @@ Default_F_CPU = 8000000
 InstructSetCore = avr5
 
 [Memory]
+SpmPagesize = 64
 FlashEnd = 0x1FFF        # last FLASH byte address (bytes: ATmega88)
 RegFileStart = 0x0000  # GP registers R0-R31
 RegFileEnd = 0x001F

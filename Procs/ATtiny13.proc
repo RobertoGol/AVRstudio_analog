@@ -8,6 +8,7 @@ Default_F_CPU = 1200000
 InstructSetCore = avr2
 
 [Memory]
+SpmPagesize = 32
 FlashEnd = 0x03FF        # last FLASH byte address (bytes: ATtiny13)
 RegFileStart = 0x0000  # GP registers R0-R31
 RegFileEnd = 0x001F
