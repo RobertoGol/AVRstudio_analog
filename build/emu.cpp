@@ -27,6 +27,7 @@ static uint16_t RAM_END   = 0x045F;
 
 static std::vector<uint8_t> g_flash(FLASH_END, 0xFF);
 static std::vector<uint8_t> g_dmem(DMEM_SIZE, 0);
+static std::vector<uint8_t> g_eeprom;     // real EEPROM backing (init 0xFF, persists across reset like hardware)
 static uint16_t g_pc = 0;           // in WORDS
 static uint64_t g_cycles = 0;
 static bool     g_loaded = false;
@@ -154,6 +155,8 @@ static void loadEnv() {
     std::string fe = pit("flashend"), re = pit("ramend");
     if (!fe.empty()) { uint64_t v = parseAddr(fe); if (v >= 256 && v <= 256*1024) { FLASH_END = (uint32_t)v; g_flash.assign(FLASH_END, 0xFF); } }
     if (!re.empty()) { uint64_t v = parseAddr(re); if (v >= 64 && v <= 64*1024) { RAM_END = (uint16_t)v; DMEM_SIZE = RAM_END + 1; g_dmem.assign(DMEM_SIZE, 0); } }
+    std::string ee = pit("eepromend");
+    if (!ee.empty()) { uint64_t v = parseAddr(ee); if (v >= 16 && v <= 8192) g_eeprom.assign((size_t)v + 1, 0xFF); }   // EepromEnd = SIZE-1
     // [Ports]: single-letter keys "B = PIN_IO DDR_IO PORT_IO"
     std::vector<Pio> np; std::vector<std::string> nn;
     for (auto& kv : p) {                                   // map sorted: A,B,C,D order
@@ -204,6 +207,19 @@ static void writeDmem(int a, int val) {
     if (a == 0x20 + 0x3F) {
         g_f.I=(val>>7)&1; g_f.T=(val>>6)&1; g_f.H=(val>>5)&1; g_f.S=(val>>4)&1;
         g_f.V=(val>>3)&1; g_f.N=(val>>2)&1; g_f.Z=(val>>1)&1; g_f.C=val&1;
+        return;
+    }
+    if (a == 0x20 + 0x1C && !g_eeprom.empty()) {   // EECR: EERIE(3) EEMWE(2) EEWE(1) EERE(0)
+        uint16_t ea = (uint16_t)((g_dmem[0x3E] | ((g_dmem[0x3F] & 0xFF) << 8)) % g_eeprom.size());
+        if (val & 0x02) {                          // EEWE=1: commit EEDR into EEPROM cell
+            g_eeprom[ea] = g_dmem[0x3D];
+            val &= ~0x02;                          // write completes instantly -> EEWE cleared
+        }
+        if (val & 0x01) {                          // EERE=1: load EEDR from cell
+            g_dmem[0x3D] = g_eeprom[ea];
+            val &= ~0x01;                          // read done -> EERE cleared
+        }
+        g_dmem[a] = (uint8_t)val;
         return;
     }
     if (a >= 0 && a < (int)DMEM_SIZE) g_dmem[a] = (uint8_t)val;
@@ -316,6 +332,8 @@ static bool loadElfSys(const std::string& path, std::string& err) {
         }
     }
     g_loaded = true;
+    // power-on: EEPROM starts erased (0xFF) at every emulate/start cycle load
+    std::fill(g_eeprom.begin(), g_eeprom.end(), 0xFF);
     return true;
 }
 
@@ -1402,27 +1420,36 @@ static bool dispatch(const std::string& line) {
     }
     if (cmd == "mem" || cmd == "m") {
         std::string region = lower(a(1));
-        if (region.empty()) { wr("Usage: mem <sram|flash> <addr> [len]   |   write: mem sram 0x60 = 0xFF", RED); return true; }
-        if (region == "eeprom") { wr(" EEPROM is not emulated (no writes/reads).", YELLOW); return true; }
-        // write mode: "mem sram 0x60 = 0xFF  [0x33]"
+        if (region.empty()) { wr("Usage: mem <sram|flash|eeprom> <addr> [len]   |   write: mem sram 0x60 = 0xFF", RED); return true; }
+        if (region == "eeprom" && g_eeprom.empty()) { wr(" EEPROM size = 0 (no EepromEnd in chip profile).", RED); return true; }
+        // region byte accessors
+        auto rGet = [&](uint32_t aa) -> int {
+            if (region == "flash")   return (aa < FLASH_END) ? g_flash[aa] : 0xFF;
+            if (region == "eeprom")  return (aa < g_eeprom.size()) ? g_eeprom[aa] : 0xFF;
+            return aa < (uint32_t)DMEM_SIZE ? readDmem((int)aa) : 0;
+        };
+        auto rSet = [&](uint32_t aa, uint8_t v) {
+            if (region == "flash")   { if (aa < FLASH_END)     { g_flash[aa] = v;  return true; } }
+            else if (region == "eeprom") { if (aa < g_eeprom.size()) { g_eeprom[aa] = v; return true; } }
+            else { if (aa < (uint32_t)DMEM_SIZE) { writeDmem((int)aa, v); return true; } }
+            return false;
+        };
+        // write mode: "mem sram 0x60 = 0xFF  [next val]"
         for (int t = 2; t <= 6; t++) {
             if (a(t) == "=" && !a(t+1).empty()) {
                 bool okA, okV; uint32_t wa = parseNum(a(t-1), okA); int v = parseNum(a(t+1), okV);
                 if (!okA || !okV) { wr(" ! Bad address/value in mem write.", RED); return true; }
-                if (region == "sram") {
-                    writeDmem((int)wa, (uint8_t)(v & 0xFF));
-                    wr(fmt(" SRAM 0x%04X := 0x%02X", wa, (uint8_t)v), GREEN);
-                } else if (region == "flash") {
-                    if (wa < FLASH_END) { g_flash[wa] = (uint8_t)(v & 0xFF); wr(fmt(" FLASH 0x%04X := 0x%02X", wa, (uint8_t)v), GREEN); }
-                    else wr(" ! Flash address out of range.", RED);
-                }
-                // optional second assignment
-                if (!a(t+3).empty()) {
+                uint32_t wai = wa;
+                int written = 0;
+                for (;;) {
+                    if (rSet(wai, (uint8_t)v)) { wr(fmt(" %s 0x%04X := 0x%02X", upper(region).c_str(), wai, (uint8_t)v), GREEN); }
+                    else { wr(fmt(" ! %s address 0x%04X out of range.", upper(region).c_str(), wai), RED); }
+                    written++;
+                    bool hasNext = (written == 1) && !a(t+3).empty();
+                    if (!hasNext) break;
                     bool okV2; int v2 = parseNum(a(t+3), okV2);
-                    if (okV2) {
-                        if (region == "sram") { writeDmem((int)wa+1, (uint8_t)(v2 & 0xFF)); wr(fmt(" SRAM 0x%04X := 0x%02X", wa+1, (uint8_t)v2), GREEN); }
-                        else if (wa+1 < FLASH_END) { g_flash[wa+1] = (uint8_t)(v2 & 0xFF); wr(fmt(" FLASH 0x%04X := 0x%02X", wa+1, (uint8_t)v2), GREEN); }
-                    }
+                    if (!okV2) break;
+                    v = v2; wai++;
                     t += 2;
                 }
                 return true;
@@ -1433,10 +1460,7 @@ static bool dispatch(const std::string& line) {
         for (int i = 0; i < len; i += 8, addr += 8) {
             char hx[32]; int w = 0;
             for (int j = 0; j < 8 && (i+j) < len; j++) {
-                int aa = (int)addr + j, v;
-                if (region == "flash") v = (aa < (int)FLASH_END) ? g_flash[aa] : 0xFF;
-                else v = aa < (int)DMEM_SIZE ? readDmem(aa) : 0;
-                w += snprintf(hx + w, sizeof(hx)-w, "%02X ", v);
+                w += snprintf(hx + w, sizeof(hx)-w, "%02X ", rGet((uint32_t)((int)addr + j)));
             }
             wr(fmt(" 0x%04X: %s", addr, hx));
         }
