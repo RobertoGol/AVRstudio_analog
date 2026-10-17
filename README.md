@@ -287,6 +287,8 @@ F_CPU = 8000000UL
 Optimization = O0
 
 [Paths]
+; Портативный вариант: можно просто кинуть bin тулчейна в <проект>\tools\bin -
+; avr.ps1 найдёт его ПЕРВЫМ (до этой записи и до классического пути), без правки конфигов.
 ToolchainBin = C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/bin
 ToolchainInc = C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/avr/include
 ProcsDir = ./Procs

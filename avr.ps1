@@ -249,14 +249,26 @@ function Proc-InfoImpl($reg) {
     else { Write-Host '  Побитовое описание: см. datasheet чипа (не в общем словаре)' -ForegroundColor DarkGray }
 }
 
-# Вызов компилятора/утилит
+# Вызов компилятора/утилит. Портативность (README п.2): поиск по порядку:
+#   1) <проект>\tools\bin  (можно просто положить сюда avr-gcc/avrdude - без установки)
+#   2) путь из echo.ctos [Paths]
+#   3) классический путь AVR Toolchain
+#   4) avr-gcc.exe из PATH
 $Toolchain = ''
 function Get-Toolchain {
-    if ($Toolchain -eq '') {
-        $Toolchain = Get-Cs 'Paths' 'ToolchainBin' ''
-        if ($Toolchain -eq '-' -or $Toolchain -eq $null -or $Toolchain -eq '') { $Toolchain = 'C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/bin' }
-        $Toolchain = $Toolchain.TrimEnd('/')
+    if ($Toolchain -ne '') { return $Toolchain }
+    $cands = @()
+    $local = Join-Path $Root 'tools\bin'
+    if (Test-Path (Join-Path $local 'avr-gcc.exe')) { $cands += $local }
+    $ct = Get-Cs 'Paths' 'ToolchainBin' ''
+    if ($ct -ne '' -and $ct -ne '-' -and $ct -ne $null) { $cands += $ct.TrimEnd('/') }
+    $cands += 'C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/bin'
+    foreach ($d in $cands) {
+        if (Test-Path (Join-Path $d 'avr-gcc.exe')) { $Toolchain = $d; return $d }
     }
+    $cmd = Get-Command 'avr-gcc.exe' -ErrorAction SilentlyContinue
+    if ($cmd -ne $null -and $cmd.Path -ne '') { $Toolchain = Split-Path -Parent $cmd.Path; return $Toolchain }
+    $Toolchain = $cands[$cands.Count - 1]
     return $Toolchain
 }
 function Find-Tool($exe) {
@@ -382,6 +394,7 @@ function Status-Impl() {
         $ok = Test-Path (Join-Path $Root $f)
         Write-Host ('  ' + $f.PadRight(30) + $(if ($ok) { '[OK]' } else { '[нет]' }) ) -ForegroundColor $(if ($ok) { 'Green' } else { 'DarkGray' })
     }
+    Write-Host ('  Тулчейн resolve: ' + (Get-Toolchain)) -ForegroundColor DarkCyan
 }
 function Help-Impl() {
     Write-Host @'
@@ -396,7 +409,9 @@ function Help-Impl() {
   disasm [<функция>]   | da       дизассемблер (objdump -dS)
   flash [<программатор>]          прошивка через avrdude (usbasp)
   emu [<скрипт>]       | em       запуск эмулятора (main.elf)
+  es | start                      запустить эмулятор интерактивно
   status               | st       состояние сессии (echo.ctos)
+  Тулчейн ищется: <проект>\tools\bin -> echo.ctos -> классич. путь -> PATH.
   help                 | h        эта справка
   exit                 | q        выход
 '@
