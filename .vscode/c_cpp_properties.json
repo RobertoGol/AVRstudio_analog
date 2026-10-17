@@ -7,7 +7,7 @@
         "C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/avr/include"
       ],
       "defines": [
-        "F_CPU=16000000UL",
+        "F_CPU=8000000UL",
         "__AVR_ATmega8__"
       ],
       "compilerPath": "C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/bin/avr-gcc.exe",

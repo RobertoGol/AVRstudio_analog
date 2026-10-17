@@ -5,7 +5,7 @@ TARGET = main
 MCU = atmega8
 
 # Частота тактования (по умолчанию 1 МГц для зав. ATmega8)
-F_CPU = 1000000UL
+F_CPU = 8000000UL
 
 # Пути к компилятору
 CC = "C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/bin/avr-gcc"

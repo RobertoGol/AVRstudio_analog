@@ -1,0 +1,33 @@
+# Профиль процессора: ATmega8A    (стандарт раздела 8 README)
+Name = ATmega8A
+MCU_Target = atmega8
+Define_Tag = __AVR_ATmega8__
+F_CPU = 8000000
+
+# 1. Геометрия памяти (Memory Layout)
+FlashEnd = 8192          # 0x2000 конечный адрес FLASH (байтовое пространство)
+FileRegsStart = 0x0000   # РОН R0-R31
+FileRegsEnd   = 0x001F
+IoStart = 0x0020         # РВВ в ОЗУ (0x00-0x3F в обход IN/OUT)
+IoEnd   = 0x005F
+SRAMStart = 0x0060
+RamEnd = 0x045F          # вершина стека SP (1 КБ SRAM)
+EEPROMEnd = 512
+
+# 2. Словарь регистров периферии (Register Mapping, I/O адреса)
+# PORTB: 0x18 (SRAM 0x38), DDRB: 0x17 (0x37), PINB: 0x16 (0x36) биты [PB7..PB0]
+# PORTC: 0x15 (0x35), DDRC: 0x14 (0x34), PINC: 0x13 (0x33) биты [PC6..PC0]
+# PORTD: 0x12 (0x32), DDRD: 0x11 (0x31), PIND: 0x10 (0x30) биты [PD7..PD0]
+# SREG: 0x3F (0x5F) биты [I T H S V N Z C]
+# SPL: 0x3D (0x5D), SPH: 0x3E (0x5E)
+
+# 3. Аппаратные правила портов (GPIO Logic)
+# DDRx бит = 1 => выход: PINx читает защёлку PORTx.
+# DDRx бит = 0 => вход: PORTx=1 включает подтяжку (Pull-Up) -> PINx читает 1 внешним сигналом.
+# Запись 1 в бит PINx при DDRx=1 инвертирует защёлку PORTx.
+
+# 4. Карта тактирования (Clock & Cycles)
+# LDI/MOV/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SBR/LSR/ASR/ROR = 1 такт
+# ADIW/SBIW/SBI/CBI/PUSH/POP/LD/ST/LPM = 2-3 такта
+# RJMP/BRxx (переход) = 2 такта; RCALL = 3; RET/RETI/CALL = 4; JMP = 3
+# Формула секундомера: Время (мкс) = Счетчик_тактов * 1e6 / F_CPU
