@@ -6,7 +6,8 @@
 #include <string>
 
 void     emuapi_sink(void (*fn)(const char* s));       // направить весь вывод в GUI
-bool     emuapi_init(const char* root, const char* elf); // root: echo.ctos + Procs/; elf: путь программы
+void     emuapi_setProcsDir(const char* procsDir);     // переопределить каталог профилей (для проектов в своей папке)
+bool     emuapi_init(const char* root, const char* elf); // root: echo.ctos + (Procs?); elf: путь программы
 bool     emuapi_load();                                 // загрузить ELF в flash
 bool     emuapi_loaded();
 void     emuapi_stop();                                 // g_running=false (вызывается из другого потока - безопасно)

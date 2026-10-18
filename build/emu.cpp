@@ -98,6 +98,7 @@ static bool g_prevValid = false;
 
 static std::string g_root;   // project root (parent of build/)
 static std::string g_elf;    // path to elf file
+static std::string g_procsPath; // переопределяет <root>/Procs (GUI: проект в своей папке, чипы - в каталоге приложения)
 
 // ---------------------------------------------------------------------
 // Console color helpers (16-color buffer, works PS1.1-era consoles)
@@ -216,7 +217,8 @@ static void loadEnv() {
     if (!it("processorprofile").empty()) g_chip = it("processorprofile");
     if (!it("f_cpu").empty())  g_fcpu = (uint32_t)atoll(it("f_cpu").c_str());
 
-    std::string prof = g_root + "/Procs/" + g_chip + ".proc";
+    std::string procsBase = g_procsPath.empty() ? (g_root + "/Procs") : g_procsPath;
+    std::string prof = procsBase + "/" + g_chip + ".proc";
     auto p = readPairs(prof);
     auto pit = [&p](const char* k){ auto i = p.find(k); return i!=p.end()? i->second : std::string(); };
     if (!pit("name").empty()) g_chip = pit("name");
@@ -2446,6 +2448,11 @@ int main(int argc, char** argv) {
 // ==================== Тонкий API для встраивания ядра в GUI ====================
 // (декларации в gui/emu_api.h; компилируется только при EMU_LIB)
 void emuapi_sink(void (*fn)(const char*)) { g_sink = fn; }
+void emuapi_setProcsDir(const char* procsDir) {
+    g_procsPath = procsDir ? procsDir : "";
+    // Windows-путь с \ -> нормализуем латинскими слэшами (консистентно с остальными)
+    for (auto& c : g_procsPath) if (c == '\\') c = '/';
+}
 bool emuapi_init(const char* root, const char* elf) {
     g_root = root ? root : ".";
     g_elf  = (elf && *elf) ? elf : (g_root + "/main.elf");

@@ -5,8 +5,11 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <string>
+#include <map>
+#include <vector>
 #include <atomic>
 
 #include "emu_api.h"   // ядро эмулятора встроено в процесс (build/emu.cpp, EMU_LIB)
@@ -148,7 +151,10 @@ static void msgAppend(const char* line) {
 // ------------------------------------------------------------- Ядро эмулятора
 static bool g_coreInit = false;                    // emuapi_init выполнен
 static std::atomic<bool> g_runBusy(false);         // работает worker-поток прогона
-static std::string g_projRoot;                     // корень проекта (echo.ctos + Procs/)
+static std::string g_projRoot;                     // корень проекта (echo.ctos + исходники)
+static std::string g_appDir;                       // папка exe (для recent.txt, шаблонов, Procs)
+static std::string g_deviceName = "ATmega8A";      // ProcessorProfile открытого проекта
+static std::string g_mcuName    = "atmega8";       // MCU_Targetффективный (для -mmcu)
 static char g_valText[16];                         // буфер строк для ListView (должен жить)
 
 static void uiAppend(const char* s) {              // вывод ядра -> Message-панель
@@ -185,16 +191,13 @@ static DWORD WINAPI runThreadProc(LPVOID) {
     return 0;
 }
 
-// старт отладки: инициализация ядра + загрузка ELF
+// старт отладки: инициализация ядра + загрузка ELF открытого проекта
 static void startDebugging() {
     if (g_runBusy) { msgAppend("-- Прогон уже работает (Break = Ctrl+F5)"); return; }
+    if (g_projRoot.empty()) { msgAppend("! Нет открытого проекта. Project > New/Open Project."); return; }
     if (!g_coreInit) {
-        // корень проекта: GUI exe живёт в <root>/gui, значит root = его родитель.
-        // (в финальной портативной сборке будет unpack-каталог)
-        char exePath[MAX_PATH]; GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-        std::string d = exePath;
-        size_t sl = d.find_last_of("\\/");         d = d.substr(0, sl);             // снимаем имя exe -> /gui
-        sl = d.find_last_of("\\/");  if (sl != std::string::npos) g_projRoot = d.substr(0, sl); else g_projRoot = ".";
+        // Procs-каталог живёт рядом с exe (общий каталог чипов на 207 профилей)
+        emuapi_setProcsDir((g_appDir + "/../Procs").c_str());
         emuapi_sink(uiAppend);
         emuapi_init(g_projRoot.c_str(), (g_projRoot + "/main.elf").c_str());
         g_coreInit = true;
@@ -210,21 +213,596 @@ static void statusSet(int part, const char* txt) {
     SendMessageA(g_status, SB_SETTEXTA, part | SBT_NOBORDERS, (LPARAM)txt);
 }
 
-// ------------------------------------------------------------- Welcome box
-// Скрин 1: "Welcome to AVR Studio 4": New Project, Open, Recent projects.
-static INT_PTR CALLBACK DlgWelcome(HWND h, UINT m, WPARAM w, LPARAM) {
+// --------------------------------------------------------------- Диалоги из кода
+// AVR Studio 4: Welcome (скрин 1) и мастер (скрины 2,5,6). .rc-ресурсы не нужны —
+// строю обычные popup-окна с дочерними контролами (DLGTEMPLATE в памяти слишком
+// хрупок: ANSI-раскладка строк и выравнивания легко съезжают).
+
+// ------------------------------------------------------------- Проект
+struct Recent { std::string name, path; };
+static std::vector<Recent> g_recent;
+static std::string g_srcPath;          // главный исходник проекта (полный путь)
+static bool g_projOpen = false;
+
+static std::string exeDirNow() {
+    char p[MAX_PATH]; GetModuleFileNameA(nullptr, p, MAX_PATH);
+    std::string s = p; size_t sl = s.find_last_of("\\/"); 
+    return sl != std::string::npos ? s.substr(0, sl) : std::string(".");
+}
+
+static bool fileExists(const std::string& path) {
+    DWORD a = GetFileAttributesA(path.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// read echo.ctos в GUI (семантика readPairs ядра: UTF-8 без BOM, key = value, секции пропускаются)
+static std::map<std::string, std::string> readCtos(const std::string& dir) {
+    std::map<std::string, std::string> out;
+    FILE* f = fopen((dir + "/echo.ctos").c_str(), "rb");
+    if (!f) return out;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        std::string s = line;
+        if (!s.empty() && s.back() == '\n') s.pop_back();
+        if (!s.empty() && s.back() == '\r') s.pop_back();
+        if (s.empty() || s[0] == '[' || s[0] == '#') continue;
+        size_t eq = s.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = s.substr(0, eq), v = s.substr(eq + 1);
+        auto trim = [](std::string t) { 
+            size_t a = t.find_first_not_of(" \t"); 
+            if (a == std::string::npos) return std::string();
+            size_t b = t.find_last_not_of(" \t");
+            return t.substr(a, b - a + 1);
+        };
+        for (auto& c : k) c = (char)tolower((unsigned char)c);
+        out[trim(k)] = trim(v);
+    }
+    fclose(f);
+    return out;
+}
+
+static void writeTextFile(const std::string& path, const std::string& content) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { msgAppend((std::string("! Не создать файл: ") + path).c_str()); return; }
+    fwrite(content.data(), 1, content.size(), f);
+    fclose(f);
+}
+
+static std::string readTextFile(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return std::string();
+    std::string s; char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
+    fclose(f);
+    return s;
+}
+
+static std::string echoTemplate(const char* device) {
+    // MCU_Target: маленькими буквами для -mmcu (avr-gcc 4.5.1 знает atmega8/8a)
+    std::string mcuL = device; for (auto& c : mcuL) c = (char)tolower((unsigned char)c);
+    std::string devU = device; for (auto& c : devU) c = (char)toupper((unsigned char)c);
+    std::string o;
+    o += "# AVR CLI Studio project state (UTF-8, no BOM)\n";
+    o += "[ActiveSession]\n";
+    o += "ProcessorProfile = " + std::string(device) + "\n";
+    o += "MCU_Target = " + mcuL + "\n";
+    o += "Define_Tag = __AVR_" + devU + "__\n";
+    o += "F_CPU = 8000000UL\n";
+    o += "Optimization = O0\n\n";
+    o += "[Paths]\n";
+    o += "ToolchainBin = C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/bin\n";
+    o += "ProcsDir = ./Procs\n";
+    o += "[EmulatorState]\n";
+    o += "LastPC = 0x0000\n";
+    return o;
+}
+
+static const char* kBlinkTemplate =
+"#include <avr/io.h>\r\n"
+"#include <util/delay.h>\r\n"
+"\r\n"
+"int main(void)\r\n"
+"{\r\n"
+"    DDRB = 0xFF;              /* PB0..PB7 as output */\r\n"
+"    for (;;) {\r\n"
+"        PORTB ^= 0x01;        /* blink PB0 */\r\n"
+"        _delay_ms(500);\r\n"
+"    }\r\n"
+"}\r\n";
+
+static void loadEditorFromFile(const std::string& path) {
+    std::string txt = readTextFile(path);
+    for (size_t i = 0; i + 1 < txt.size() && txt[i] == 0xEF && txt[i+1] == 0xBB && txt[i+2] == 0xBF; ) 
+        txt.erase(0, 3);                       // снять BOM
+    // CRLF-фикс для EDIT
+    if (txt.find("\r\n") == std::string::npos) {
+        std::string out; out.reserve(txt.size() + 64);
+        for (char c : txt) { if (c == '\n') out += "\r\n"; else out += c; }
+        txt = out;
+    }
+    SetWindowTextA(g_editMain, txt.c_str());
+    g_srcPath = path;
+}
+
+static void saveEditor() {
+    if (g_srcPath.empty()) { msgAppend("! Нет файла для сохранения"); return; }
+    int n = GetWindowTextLengthA(g_editMain);
+    if (n < 0) n = 0;
+    // EDIT отдаёт текст с \r\n - в файл пишем как есть (норм для gcc)
+    std::string txt(n, 0);
+    GetWindowTextA(g_editMain, &txt[0], n + 1);
+    writeTextFile(g_srcPath, txt);
+    msgAppend(("Saved: " + g_srcPath).c_str());
+}
+
+// перечень чипов из каталога профилей (для мастера - скрин 5/6, список устройств)
+static std::vector<std::string> listDevices(const std::string& procsDir) {
+    std::vector<std::string> out;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((procsDir + "/*.proc").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        std::string n = fd.cFileName;
+        size_t dot = n.rfind(".proc");
+        if (dot != std::string::npos) n = n.substr(0, dot);
+        out.push_back(n);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return out;
+}
+
+static void addRecent(const std::string& name, const std::string& path) {
+    for (size_t i = 0; i < g_recent.size(); i++)
+        if (g_recent[i].path == path) { g_recent.erase(g_recent.begin() + i); break; }
+    Recent r; r.name = name; r.path = path;
+    g_recent.insert(g_recent.begin(), r);
+    if (g_recent.size() > 9) g_recent.resize(9);
+    // сохранить
+    std::string s;
+    for (auto& r : g_recent) s += r.name + "|" + r.path + "\n";
+    writeTextFile(g_appDir + "/recent.txt", s);
+}
+
+static void loadRecent() {
+    std::string s = readTextFile(g_appDir + "/recent.txt");
+    size_t p = 0;
+    while (p < s.size()) {
+        size_t e = s.find('\n', p); if (e == std::string::npos) e = s.size();
+        std::string ln = s.substr(p, e - p); p = e + 1;
+        size_t bar = ln.find('|');
+        if (bar != std::string::npos) {
+            Recent r; r.name = ln.substr(0, bar); r.path = ln.substr(bar + 1);
+            g_recent.push_back(r);
+        }
+    }
+}
+
+// открыть проект: dir с echo.ctos
+static void openProjectAt(const std::string& projDir) {
+    auto cfg = readCtos(projDir);
+    g_projRoot = projDir;
+    g_deviceName = cfg.count("processorprofile") ? cfg["processorprofile"] : "ATmega8A";
+    g_mcuName    = cfg.count("mcu_target") ? cfg["mcu_target"] : std::string();
+    if (g_mcuName.empty()) { g_mcuName = g_deviceName; for (auto& c : g_mcuName) c = (char)tolower((unsigned char)c); }
+    g_projOpen = true;
+    g_coreInit = false;        // следующий Start Debugging перечитает окружение
+    std::string src = readTextFile(projDir + "/main.c").size() ? projDir + "/main.c" : projDir + "/main.asm";
+    if (fileExists(src)) loadEditorFromFile(src);
+    else { g_srcPath = projDir + "/main.c"; SetWindowTextA(g_editMain, "\r\n"); }
+    statusSet(0, g_deviceName.c_str());
+    msgAppend((std::string("Project opened: ") + projDir).c_str());
+    msgAppend((std::string("Device: " + g_deviceName + "  (mcu=" + g_mcuName + ")").c_str()));
+}
+
+static std::string folderNameOf(const std::string& p) {
+    std::string s = p;
+    while (!s.empty() && (s.back() == '\\' || s.back() == '/')) s.pop_back();
+    size_t sl = s.find_last_of("\\/");
+    return sl != std::string::npos ? s.substr(sl + 1) : s;
+}
+
+static void browseLocation(HWND h, int editId) {
+    char buf[MAX_PATH] = "";
+    BROWSEINFOA bi = {0};
+    bi.hwndOwner = h; bi.lpszTitle = "Выберите папку проекта"; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
+    if (pidl) {
+        char p[MAX_PATH]; SHGetPathFromIDListA(pidl, p);
+        CoTaskMemFree(pidl);
+        SetDlgItemTextA(h, editId, p);
+    }
+}
+
+// создать проект по данным мастера (скрин 2/6)
+static std::string g_wizType = "AVR GCC", g_wizDevice = "ATmega8A";
+static bool createProject(HWND h) {
+    char name[MAX_PATH], loc[MAX_PATH], initF[MAX_PATH];
+    GetDlgItemTextA(h, 210, name, MAX_PATH);              // Project name
+    GetDlgItemTextA(h, 213, loc, MAX_PATH);               // Location
+    GetDlgItemTextA(h, 212, initF, MAX_PATH);             // Initial file
+    if (!name[0] || !loc[0]) { MessageBoxA(h, "Имя проекта и папка обязательны.", "Новый проект", MB_OK | MB_ICONWARNING); return false; }
+    std::string dir = std::string(loc) + "\\" + name;
+    if (GetFileAttributesA(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        if (!CreateDirectoryA(dir.c_str(), nullptr)) {
+            MessageBoxA(h, "Не удалось создать папку проекта.", "Новый проект", MB_OK | MB_ICONERROR);
+            return false;
+        }
+    }
+    bool isAsm = g_wizType.find("Assembler") != std::string::npos;
+    std::string srcName = initF[0] ? initF : (isAsm ? "main.asm" : "main.c");
+    writeTextFile(dir + "/echo.ctos", echoTemplate(g_wizDevice.c_str()));
+    if (isAsm) {
+        std::string asmSrc;
+        asmSrc += std::string("; ") + name + " - new project (Atmel AVR Assembler)\n";
+        asmSrc += "; Device: " + g_wizDevice + "\n";
+        asmSrc += ".nolist\n.include \"m8def.inc\"\n.list\n";
+        asmSrc += "    rjmp    init\ninit:\n";
+        asmSrc += "    ser     r16\n";
+        asmSrc += "    out     0x17, r16   ; DDRB = 0xFF\n";
+        asmSrc += "loop:\n    rjmp    loop\n";
+        writeTextFile(dir + "/" + srcName, asmSrc);
+    } else {
+        writeTextFile(dir + "/" + srcName, kBlinkTemplate);
+    }
+    writeTextFile(dir + "/project.avrs",
+        std::string("type = ") + (isAsm ? "asm" : "gcc") + "\ndevice = " + g_wizDevice + "\n");
+    openProjectAt(dir);
+    addRecent(name, dir);
+    msgAppend((std::string("Project created: ") + dir).c_str());
+    statusSet(0, g_wizDevice.c_str());
+    return true;
+}
+
+// сборка проекта через avr-gcc (скрин 8, Build-меню AS4); вывод -> Message
+static void msgAppendStr(const std::string& s) { msgAppend(s.c_str()); }
+
+static void runToolAppend(const std::string& cmdline, const std::string& cwd) {
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    HANDLE rPipe = nullptr, wPipe = nullptr;
+    CreatePipe(&rPipe, &wPipe, &sa, 0);
+    SetHandleInformation(wPipe, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = wPipe; si.hStdError = wPipe;
+    PROCESS_INFORMATION pi = {};
+    std::string cmd = cmdline;
+    BOOL ok = CreateProcessA(nullptr, &cmd[0], nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, cwd.c_str(), &si, &pi);
+    CloseHandle(wPipe);
+    if (!ok) { msgAppendStr("! Не запустить: " + cmdline); CloseHandle(rPipe); return; }
+    char buf[4096]; DWORD n = 0;
+    std::string out;
+    while (ReadFile(rPipe, buf, sizeof(buf) - 1, &n, nullptr) && n > 0) {
+        buf[n] = 0; out += buf;
+        if (out.size() > 65536) { msgAppend(out.c_str()); out.clear(); }
+    }
+    CloseHandle(rPipe);
+    if (!out.empty()) msgAppendStr(out);
+    DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    msgAppendStr((std::string(code ? "! Build FAILED (code=" : "Build OK (code=") +
+               std::to_string((DWORD)code) + ")"));
+}
+
+static void buildProject(bool andRun) {
+    if (!g_projOpen) { msgAppend("! Нет открытого проекта. Project > New/Open Project."); return; }
+    saveEditor();
+    auto cfg = readCtos(g_projRoot);
+    std::string tcBin = cfg.count("toolchainbin") ? cfg["toolchainbin"] :
+        std::string("C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/bin");
+    std::string gcc = tcBin + "/avr-gcc.exe";
+    if (!fileExists(gcc)) { msgAppendStr("! avr-gcc не найден: " + gcc); return; }
+    std::string src = g_srcPath;
+    if (!fileExists(src)) { msgAppendStr("! Нет исходника: " + src); return; }
+    std::string opt = cfg.count("optimization") ? cfg["optimization"] : std::string("O0");
+    std::string elf = "\"" + g_projRoot + "/main.elf\"";
+    msgAppend((std::string("-- Build (device ") + g_deviceName + ", mcu " + g_mcuName + ", -" + opt + ")").c_str());
+    // avr-gcc 4.5.1: не все современные суффиксы знает - пробуем полный mcu,
+    // при неудаче укорачиваем имя по букве (atmega8a -> atmega8) и ретраим
+    std::string mcu = g_mcuName;
+    std::string gccBase = "\"" + gcc + "\"";
+    for (int attempt = 0; attempt < 4; attempt++) {
+        std::string cmdline = gccBase + " -mmcu=" + mcu + " -g -" + opt +
+                              " -DF_CPU=8000000UL -o " + elf +
+                              " \"" + src + "\"";
+        if (attempt) msgAppend((std::string("-- retry: -mmcu=") + mcu).c_str());
+        runToolAppend(cmdline, g_projRoot);
+        if (fileExists(g_projRoot + "/main.elf")) break;
+        if (mcu.size() > 2) mcu.pop_back(); else break;
+    }
+    if (andRun && fileExists(g_projRoot + "/main.elf")) {
+        msgAppend("-- Build and Run: запуск отладки");
+        startDebugging();
+        if (g_coreInit && emuapi_loaded() && !g_runBusy) {
+            g_runBusy = true;
+            CreateThread(nullptr, 0, runThreadProc, nullptr, 0, nullptr);
+        }
+    }
+}
+
+// ------------------------------------------------------------- Welcome (скрин 1)
+// Popup-окно вместо DLGTEMPLATE: надёжно, позиция контролов в пикселях.
+static char g_recentName[200];   // выбранный recent
+
+static HFONT g_uiFont = nullptr, g_uiFontBig = nullptr;
+
+static HFONT uiFont() {
+    if (!g_uiFont) g_uiFont = CreateFontA(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, RUSSIAN_CHARSET,
+        0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
+    return g_uiFont;
+}
+static HFONT uiFontBig() {
+    if (!g_uiFontBig) g_uiFontBig = CreateFontA(-26, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, RUSSIAN_CHARSET,
+        0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
+    return g_uiFontBig;
+}
+
+static HWND mkCtrl(HWND parent, const char* cls, const char* title, DWORD style,
+                   int x, int y, int cx, int cy, int id, HFONT font) {
+    HWND c = CreateWindowExA(0, cls, title, WS_CHILD | WS_VISIBLE | style,
+                             x, y, cx, cy, parent, (HMENU)(intptr_t)id, GetModuleHandleA(nullptr), nullptr);
+    SendMessageA(c, WM_SETFONT, (WPARAM)(font ? font : uiFont()), TRUE);
+    return c;
+}
+
+// центрирование относительно владельца
+static void centerPopup(HWND h, HWND owner, int w, int hgt, int* outX, int* outY) {
+    RECT orr = {0, 0, 1200, 800};
+    if (owner) GetWindowRect(owner, &orr);
+    *outX = orr.left + ((orr.right - orr.left) - w) / 2;
+    *outY = orr.top + ((orr.bottom - orr.top) - hgt) / 2;
+}
+
+struct WelState { HWND h; HWND owner; int result; };
+static WelState g_wel = {nullptr, nullptr, 0};
+
+static void welClose(HWND h, int result) {
+    g_wel.result = result;
+    DestroyWindow(h);
+}
+
+static LRESULT CALLBACK WelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-        case WM_INITDIALOG: {
-            RECT r; GetWindowRect(GetParent(h) ? GetParent(h) : h, &r); (void)r;
-            return TRUE;
+        case WM_CREATE: {
+            mkCtrl(h, "Static", "Welcome to AVR Studio 4", SS_LEFT, 20, 14, 420, 36, 500, uiFontBig());
+            mkCtrl(h, "Button", "&New Project", BS_DEFPUSHBUTTON, 20, 64, 150, 38, 501, nullptr);
+            mkCtrl(h, "Button", "&Open Project...", BS_PUSHBUTTON, 20, 108, 150, 38, 502, nullptr);
+            mkCtrl(h, "Button", "Recent projects", BS_GROUPBOX, 184, 56, 262, 96, 0, nullptr);
+            HWND lb = mkCtrl(h, "ListBox", "", LBS_NOTIFY | WS_VSCROLL | WS_BORDER | LBS_HASSTRINGS,
+                             196, 72, 238, 72, 503, nullptr);
+            for (auto& r : g_recent) SendMessageA(lb, LB_ADDSTRING, 0, (LPARAM)r.name.c_str());
+            mkCtrl(h, "Button", "Show dialog at startup", BS_AUTOCHECKBOX, 20, 300, 190, 20, 504, nullptr);
+            mkCtrl(h, "Button", "Cancel", BS_PUSHBUTTON, 370, 298, 76, 24, IDCANCEL, nullptr);
+            SendMessageA(GetDlgItem(h, 504), BM_SETCHECK, BST_CHECKED, 0);
+            return 0;
         }
         case WM_COMMAND:
-            if (LOWORD(w) == IDCANCEL || LOWORD(w) == 2) { EndDialog(h, 0); return TRUE; }
-            if (LOWORD(w) == 101) { EndDialog(h, 1); return TRUE; }      // New Project
-            if (LOWORD(w) == 102) { EndDialog(h, 2); return TRUE; }      // Open
+            switch (LOWORD(w)) {
+                case 501: welClose(h, 1); return 0;          // New Project
+                case 502: welClose(h, 2); return 0;          // Open Project
+                case IDCANCEL: welClose(h, 0); return 0;
+                case 503:
+                    if (HIWORD(w) == LBN_DBLCLK) {
+                        int sel = SendDlgItemMessageA(h, 503, LB_GETCURSEL, 0, 0);
+                        if (sel >= 0 && sel < (int)g_recent.size()) {
+                            strcpy(g_recentName, g_recent[sel].path.c_str());
+                            welClose(h, 3); return 0;
+                        }
+                    }
+                    break;
+            }
             break;
+        case WM_CLOSE:
+            welClose(h, 0); return 0;
+        case WM_DESTROY:
+            if (g_wel.h == h) g_wel.h = nullptr;
+            return 0;
     }
-    return FALSE;
+    return DefWindowProcA(h, m, w, l);
+}
+
+// модальный цикл для popup-окна (владелец заблокирован)
+static int runModalPopup(HWND popup, HWND owner, HWND* alive, int* result) {
+    EnableWindow(owner, FALSE);
+    ShowWindow(popup, SW_SHOW);
+    SetForegroundWindow(popup);
+    MSG msg;
+    while (*alive && GetMessageA(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    return result ? *result : 0;
+}
+
+static const char kWelClass[] = "AVRCLI_Welcome";
+
+static int showWelcome(HWND parent) {
+    if (!parent) parent = g_main;
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = WelProc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = kWelClass;
+    wc.hCursor = LoadCursorA(nullptr, (LPCSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassA(&wc);
+
+    int W = 480, H = 380, x, y;
+    centerPopup(nullptr, parent, W, H, &x, &y);
+    g_wel.h = CreateWindowExA(WS_EX_DLGMODALFRAME, kWelClass, "Welcome to AVR Studio 4",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, W, H, parent, nullptr,
+        GetModuleHandleA(nullptr), nullptr);
+    g_wel.owner = parent;
+    g_wel.result = 0;
+    return runModalPopup(g_wel.h, parent, &g_wel.h, &g_wel.result);
+}
+
+// ------------------------------------------------------------- Мастер проекта (скрины 2/5/6)
+static const int kWizPage1[] = { 211, 220, 210, 225, 226, 212, 228, 213, 229, 231 };
+static const int kWizPage2[] = { 340, 344, 341, 342, 343 };
+
+static void wizShowPage(HWND h, int page) {
+    for (int id : kWizPage1) ShowWindow(GetDlgItem(h, id), page == 1 ? SW_SHOW : SW_HIDE);
+    for (int id : kWizPage2) ShowWindow(GetDlgItem(h, id), page == 2 ? SW_SHOW : SW_HIDE);
+    SetFocus(GetDlgItem(h, page == 1 ? 211 : 341));
+}
+
+struct WizState { HWND h; HWND owner; int finished; };
+static WizState g_wiz = {nullptr, nullptr, false};
+
+static void wizClose(HWND h, bool finished) {
+    g_wiz.finished = finished;
+    DestroyWindow(h);
+}
+
+static LRESULT CALLBACK WizProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_CREATE: {
+            // страница 1: тип/имя/исходник/папка (скрин 2)
+            mkCtrl(h, "Static", "1. What do you want to do?", SS_LEFT, 16, 14, 300, 20, 0, nullptr);
+            HWND lb = mkCtrl(h, "ListBox", "", LBS_NOTIFY | LBS_HASSTRINGS | WS_VSCROLL | WS_BORDER,
+                             16, 38, 280, 52, 211, nullptr);
+            SendMessageA(lb, LB_ADDSTRING, 0, (LPARAM)"Atmel AVR Assembler");
+            SendMessageA(lb, LB_ADDSTRING, 0, (LPARAM)"AVR GCC");
+            SendMessageA(lb, LB_SETCURSEL, 1, 0);
+            g_wiz.h = h; g_wiz.finished = false; g_wiz.owner = (HWND)((CREATESTRUCTA*)l)->lpCreateParams;
+            mkCtrl(h, "Static", "Project name:", SS_LEFT, 16, 108, 90, 18, 220, nullptr);
+            mkCtrl(h, "Edit", "", ES_LEFT | WS_BORDER | WS_TABSTOP, 110, 104, 250, 24, 210, nullptr);
+            mkCtrl(h, "Button", "Create initial file", BS_AUTOCHECKBOX, 16, 140, 160, 20, 225, nullptr);
+            mkCtrl(h, "Static", "Initial file:", SS_LEFT, 16, 170, 80, 18, 226, nullptr);
+            mkCtrl(h, "Edit", "", ES_LEFT | WS_BORDER | WS_TABSTOP, 110, 166, 250, 24, 212, nullptr);
+            mkCtrl(h, "Static", "Location:", SS_LEFT, 16, 200, 80, 18, 228, nullptr);
+            mkCtrl(h, "Edit", "", ES_LEFT | WS_BORDER | WS_TABSTOP, 110, 196, 180, 24, 213, nullptr);
+            mkCtrl(h, "Button", "Browse...", BS_PUSHBUTTON, 296, 196, 64, 24, 229, nullptr);
+            mkCtrl(h, "Button", "Create folder", BS_AUTOCHECKBOX, 16, 230, 120, 20, 231, nullptr);
+            // страница 2: платформа + чип (скрины 5/6; чипы из каталога Procs)
+            mkCtrl(h, "Static", "2. Select debug platform and device", SS_LEFT, 16, 14, 320, 20, 340, nullptr);
+            mkCtrl(h, "Static", "Debug platform:", SS_LEFT, 16, 40, 110, 18, 344, nullptr);
+            lb = mkCtrl(h, "ListBox", "", LBS_NOTIFY | LBS_HASSTRINGS | WS_VSCROLL | WS_BORDER,
+                        16, 60, 210, 180, 341, nullptr);
+            const char* plats[] = { "AVR Dragon", "AVR ONE!", "AVR Simulator", "AVR Simulator 2",
+                                    "ICE200", "ICE40", "ICE50", "JTAG ICE", "JTAGICE mkII" };
+            for (auto p : plats) SendMessageA(lb, LB_ADDSTRING, 0, (LPARAM)p);
+            SendMessageA(lb, LB_SETCURSEL, 3, 0);               // AVR Simulator 2
+            mkCtrl(h, "Static", "Device:", SS_LEFT, 240, 40, 110, 18, 342, nullptr);
+            lb = mkCtrl(h, "ListBox", "", LBS_NOTIFY | LBS_HASSTRINGS | WS_VSCROLL | WS_BORDER,
+                        240, 60, 240, 268, 343, nullptr);
+            auto devs = listDevices(g_appDir + "/../Procs");
+            int devSel = -1, prefIdx = -1;
+            for (size_t i = 0; i < devs.size(); i++) {
+                SendMessageA(lb, LB_ADDSTRING, 0, (LPARAM)devs[i].c_str());
+                if (devs[i] == "ATmega8") prefIdx = (int)i;
+                if (devs[i] == g_wizDevice) devSel = (int)i;
+            }
+            SendMessageA(lb, LB_SETCURSEL, devSel >= 0 ? devSel : (prefIdx >= 0 ? prefIdx : 0), 0);
+            // полоса кнопок внизу
+            mkCtrl(h, "Button", "<< Back", BS_PUSHBUTTON, 16, 386, 70, 26, 320, nullptr);
+            mkCtrl(h, "Button", "Next >", BS_DEFPUSHBUTTON, 400, 386, 70, 26, 321, nullptr);
+            mkCtrl(h, "Button", "Fin&ish", BS_PUSHBUTTON, 474, 386, 70, 26, IDOK, nullptr);
+            mkCtrl(h, "Button", "Cancel", BS_PUSHBUTTON, 548, 386, 70, 26, IDCANCEL, nullptr);
+            SetDlgItemTextA(h, 210, "project1");
+            SetDlgItemTextA(h, 212, "main.c");
+            SendMessageA(GetDlgItem(h, 225), BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageA(GetDlgItem(h, 231), BM_SETCHECK, BST_CHECKED, 0);
+            std::string loc = g_appDir + "/..";
+            SetDlgItemTextA(h, 213, loc.c_str());               // стартовая точка местоположения
+            wizShowPage(h, 1);
+            return 0;
+        }
+        case WM_COMMAND:
+            switch (LOWORD(w)) {
+                case 211:   // выбрали тип
+                    if (HIWORD(w) == LBN_SELCHANGE) {
+                        char t[32]; GetDlgItemTextA(h, 211, t, sizeof(t));
+                        g_wizType = t;
+                        SetDlgItemTextA(h, 212, std::string(t).find("Assembler") != std::string::npos ? "main.asm" : "main.c");
+                    }
+                    break;
+                case 343:
+                    if (HIWORD(w) == LBN_SELCHANGE) {
+                        char d[64]; GetDlgItemTextA(h, 343, d, sizeof(d));
+                        g_wizDevice = d;
+                    }
+                    break;
+                case 229:   // Browse...
+                    browseLocation(h, 213);
+                    break;
+                case 320:   // << Back
+                    wizShowPage(h, 1);
+                    break;
+                case 321: { // Next >
+                    char nm[MAX_PATH], loc[MAX_PATH];
+                    GetDlgItemTextA(h, 210, nm, MAX_PATH);
+                    GetDlgItemTextA(h, 213, loc, MAX_PATH);
+                    if (!nm[0] || !loc[0]) { MessageBoxA(h, "Укажите имя проекта и папку.", "Wizard", MB_OK | MB_ICONWARNING); break; }
+                    wizShowPage(h, 2);
+                    break;
+                }
+                case IDOK: {   // Finish
+                    if (!createProject(h)) return 0;
+                    wizClose(h, true);
+                    return 0;
+                }
+                case IDCANCEL:
+                    wizClose(h, false);
+                    return 0;
+            }
+            break;
+        case WM_CLOSE:
+            wizClose(h, false); return 0;
+        case WM_DESTROY:
+            if (g_wiz.h == h) g_wiz.h = nullptr;
+            return 0;
+    }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static const char kWizClass[] = "AVRCLI_Wizard";
+
+static bool showWizard(HWND parent) {
+    if (!parent) parent = g_main;
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = WizProc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = kWizClass;
+    wc.hCursor = LoadCursorA(nullptr, (LPCSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassA(&wc);
+
+    int W = 660, H = 470, x, y;
+    centerPopup(nullptr, parent, W, H, &x, &y);
+    g_wiz.h = CreateWindowExA(WS_EX_DLGMODALFRAME, kWizClass, "AVR Studio Wizard. New Project",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, W, H, parent, nullptr,
+        GetModuleHandleA(nullptr), nullptr);
+    // WizProc создаёт контролы, потом модальный цикл
+    g_wiz.finished = false;
+    runModalPopup(g_wiz.h, parent, &g_wiz.h, &g_wiz.finished);
+    return g_wiz.finished;
+}
+
+// Project > Open Project (GetOpenFileNameA для .avrs / echo.ctos)
+static char g_openBuf[MAX_PATH * 3];
+
+static void openProjectDialog(HWND h) {
+    OPENFILENAMEA of = {0};
+    g_openBuf[0] = 0;
+    of.lStructSize = sizeof(of);
+    of.hwndOwner = h;
+    of.lpstrFilter = "Project Files (*.avrs, echo.ctos)\0*.avrs;echo.ctos\0All Files (*.*)\0*.*\0";
+    of.lpstrFile = g_openBuf;
+    of.nMaxFile = MAX_PATH;
+    of.lpstrTitle = "Open Project";
+    of.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameA(&of)) return;
+    std::string p = g_openBuf;
+    std::string dir = p;
+    size_t sl = dir.find_last_of("\\/");
+    dir = sl != std::string::npos ? dir.substr(0, sl) : dir;
+    openProjectAt(dir);
+    addRecent(folderNameOf(dir), dir);
 }
 
 // --------------------------------------------------------------- Main proc
@@ -307,6 +885,45 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     emuapi_stop();
                     msgAppend("-- Debugging stopped");
                     return 0;
+                // ---- Project ----
+                case IDM_PROJ_WIZARD:
+                case IDM_PROJ_NEW:
+                    showWizard(h);
+                    return 0;
+                case IDM_PROJ_OPEN:
+                    openProjectDialog(h);
+                    return 0;
+                case IDM_PROJ_SAVE:      // пересохранение echo.ctos пока не нужно - project.avrs уже на диске
+                    msgAppend("Project state is saved on disk (echo.ctos)");
+                    return 0;
+                // ---- Build ----
+                case IDM_BUILD_COMPILE:
+                case IDM_BUILD_BUILD:
+                    buildProject(false);
+                    return 0;
+                case IDM_BUILD_RUN:
+                    buildProject(true);
+                    return 0;
+                case IDM_BUILD_CLEAN:
+                    if (g_projOpen) {
+                        std::string elf = g_projRoot + "/main.elf";
+                        if (DeleteFileA(elf.c_str())) msgAppend("-- Cleaned: main.elf удалён");
+                        else msgAppend("-- Cleaned: main.elf не найден");
+                    }
+                    return 0;
+                // ---- File ----
+                case IDM_FILE_SAVE:
+                case IDM_FILE_SAVEALL:
+                    saveEditor();
+                    return 0;
+                case IDM_FILE_PRINT:
+                case IDM_FILE_PRINTSETUP:
+                case IDM_FILE_CLOSE:
+                case IDM_FILE_SAVEAS:
+                case IDM_FILE_NEW:
+                case IDM_FILE_OPEN:
+                    msgAppend((std::string("[menu] id=") + std::to_string(id)).c_str());
+                    return 0;
             }
             msgAppend((std::string("[menu] id=") + std::to_string(id)).c_str());
             return 0;
@@ -322,6 +939,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     SetUnhandledExceptionFilter(crashFilter);
+    g_appDir = exeDirNow();
+    loadRecent();
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES
         | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
@@ -524,6 +1143,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
         { FVIRTKEY | FSHIFT,       VK_F11, IDM_DBG_STEPOUT },
     };
     HACCEL hacc = CreateAcceleratorTableA(acc, sizeof(acc)/sizeof(acc[0]));
+
+    // Welcome-диалог при старте (скрин 1); из него же сразу можно открыть недавний проект
+    int w = showWelcome(g_main);
+    if (w == 1) showWizard(g_main);
+    else if (w == 2) openProjectDialog(g_main);
+    else if (w == 3 && g_recentName[0]) openProjectAt(g_recentName);
 
     MSG msg;
     while (GetMessageA(&msg, 0, 0, 0) > 0) {
