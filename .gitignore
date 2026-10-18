@@ -1,0 +1,4 @@
+res/portable.o
+gui/avrstudio.exe
+build/emu.exe
+*.o
