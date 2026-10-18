@@ -455,6 +455,11 @@ static LRESULT CALLBACK ProcWinProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcA(h, m, w, l);
 }
 
+static void refreshMemWin();   // (учтите ниже) вперёд - окна Memory/Watch/Disassembler
+static void refreshWatchWin();
+static void refreshDisWin();
+static void buildDisRows();
+
 static void refreshProcWin() {
     if (!g_coreInit) return;
     bool wsListVis = g_wsList && IsWindowVisible(g_wsList);
@@ -480,6 +485,9 @@ static void refreshProcWin() {
         snprintf(t, sizeof(t), "0x%02X", emuapi_readSram((int)r));
         procSetItem(10 + (int)r, t);
     }
+    refreshMemWin();
+    refreshWatchWin();
+    refreshDisWin();
 }
 
 static void addProcRowsOnce(HWND list) {
@@ -532,8 +540,272 @@ static bool showProcWin(HWND parent) {
     return true;
 }
 
+// ---------------------------------------------------- Memory / Watch / Disassembler
+// Отладочные окна как в AS4 (View > Memory Alt-4, Watch Alt-1, Disassembler);
+// рефреш после каждого шага - вместе с refreshProcWin.
+static void refreshMemWin();
+static void refreshWatchWin();
+static void refreshDisWin();
+static void buildDisRows();
+static void watchResolve();
+
+// парсер литерала "0x56"/"123" для Watch
+static int parseNumGui(const char* s, bool& ok) {
+    ok = (s && *s);
+    if (!ok) return 0;
+    int r; char* end = nullptr;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) r = (int)strtoul(s + 2, &end, 16);
+    else r = (int)strtoul(s, &end, 10);
+    ok = (r >= 0);
+    return r;
+}
+static std::string hex4(int a) {
+    char t[24]; snprintf(t, sizeof(t), "0x%04X", a);
+    return t;
+}
+
+static HWND g_memWin = 0, g_memList = 0;
+static HWND g_watchWin = 0, g_watchList = 0, g_watchEdit = 0, g_watchAddBtn = 0;
+static HWND g_disWin = 0, g_disList = 0;
+static bool g_disBuilt = false;
+static std::vector<std::pair<std::string, int>> g_watchItems;   // имя -> SRAM-адрес
+
+// приложения утилитных окон: общий proc-стиль (скрытие крестиком)
+template<int KIND>
+static LRESULT CALLBACK ToolWinProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_SIZE:
+            if (HWND c = GetWindow(h, GW_CHILD))
+                MoveWindow(c, 0, 0, LOWORD(l), HIWORD(l), TRUE);
+            return 0;
+        case WM_CLOSE: ShowWindow(h, SW_HIDE); return 0;
+        case WM_COMMAND:
+            // Watch: кнопка Add (id 3) или Enter в edit (id 2)
+            if (KIND == 1 && (LOWORD(w) == 3 || (LOWORD(w) == 2 && (HIWORD(w) == 0x0400)))) { watchResolve(); return 0; }  // 0x0400 = NM_RETURN
+            break;
+    }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static void registerToolWin(const char* cls, WNDPROC wp) {
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = wp;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = cls;
+    wc.hCursor = LoadCursorA(nullptr, (LPCSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassA(&wc);
+}
+
+static void showMemWin(HWND parent) {
+    if (!parent) parent = g_main;
+    if (!g_memWin) {
+        registerToolWin("AVRCLI_MemWin", ToolWinProc<0>);
+        g_memWin = CreateWindowExA(WS_EX_TOOLWINDOW, "AVRCLI_MemWin", "Memory",
+            WS_POPUP | WS_CAPTION | WS_SIZEBOX | WS_SYSMENU, 120, 520, 640, 300,
+            parent, nullptr, GetModuleHandleA(nullptr), nullptr);
+        g_memList = CreateWindowExA(0, WC_LISTVIEWA, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
+            0, 0, 636, 270, g_memWin, (HMENU)(intptr_t)1, GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(g_memList, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        LVCOLUMNA col = {0};
+        col.mask = LVCF_TEXT | LVCF_WIDTH;
+        col.cx = 76; col.pszText = (LPSTR)"Address";
+        SendMessageA(g_memList, LVM_INSERTCOLUMNA, 0, (LPARAM)&col);
+        char name[8];
+        for (int b = 0; b < 16; b++) {
+            snprintf(name, sizeof(name), "+%X", b);
+            col.cx = 32; col.pszText = name;
+            SendMessageA(g_memList, LVM_INSERTCOLUMNA, 1 + b, (LPARAM)&col);
+        }
+        col.cx = 90; col.pszText = (LPSTR)"ASCII";
+        SendMessageA(g_memList, LVM_INSERTCOLUMNA, 17, (LPARAM)&col);
+    }
+    ShowWindow(g_memWin, SW_SHOW);
+    refreshMemWin();
+}
+
+static void showWatchWin(HWND parent) {
+    if (!parent) parent = g_main;
+    if (!g_watchWin) {
+        registerToolWin("AVRCLI_WatchWin", ToolWinProc<1>);
+        g_watchWin = CreateWindowExA(WS_EX_TOOLWINDOW, "AVRCLI_WatchWin", "Watch",
+            WS_POPUP | WS_CAPTION | WS_SIZEBOX | WS_SYSMENU, 790, 520, 380, 260,
+            parent, nullptr, GetModuleHandleA(nullptr), nullptr);
+        g_watchList = CreateWindowExA(0, WC_LISTVIEWA, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
+            0, 0, 376, 190, g_watchWin, (HMENU)(intptr_t)1, GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(g_watchList, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        LVCOLUMNA col = {0};
+        col.mask = LVCF_TEXT | LVCF_WIDTH;
+        col.cx = 150; col.pszText = (LPSTR)"Name";
+        SendMessageA(g_watchList, LVM_INSERTCOLUMNA, 0, (LPARAM)&col);
+        col.cx = 120; col.pszText = (LPSTR)"Value";
+        SendMessageA(g_watchList, LVM_INSERTCOLUMNA, 1, (LPARAM)&col);
+        col.cx = 90; col.pszText = (LPSTR)"Address";
+        SendMessageA(g_watchList, LVM_INSERTCOLUMNA, 2, (LPARAM)&col);
+        SendMessageA(g_watchList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+        // строка добавления: edit + кнопка Add
+        g_watchEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 4, 224, 280, 22, g_watchWin, (HMENU)2, GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(g_watchEdit, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        g_watchAddBtn = CreateWindowExA(0, "BUTTON", "Add Watch",
+            WS_CHILD | WS_VISIBLE, 292, 222, 84, 24, g_watchWin, (HMENU)3, GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(g_watchAddBtn, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+    }
+    ShowWindow(g_watchWin, SW_SHOW);
+    refreshWatchWin();
+}
+
+// Add Watch: имя/адрес; символы из ELF/DWARF, регистры из [RegisterMap], либо число
+static void watchResolve() {
+    if (!g_watchEdit) return;
+    char name[128];
+    GetWindowTextA(g_watchEdit, name, sizeof(name));
+    // обрезать пробелы
+    char* e = name + strlen(name);
+    while (e > name && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+    char* s = name;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s) return;
+    int addr = -1;
+    uint32_t sym = 0;
+    bool isn = false; int num = (int)parseNumGui(s, isn);
+    if (isn) addr = num;
+    else if (emuapi_findReg(s, &addr)) { }
+    else if (emuapi_findSymbol(s, &sym)) addr = (int)(sym & 0xFFFF);   // SRAM-переменные и т.п.
+    if (addr >= 0 && addr < 4096) {
+        for (auto& kv : g_watchItems) if (kv.first == s) { msgAppend("-- Watch: уже добавлен"); return; }
+        g_watchItems.push_back({ s, addr });
+        msgAppend((std::string("-- Watch added: ") + s + " @ " + hex4(addr)).c_str());
+        SetWindowTextA(g_watchEdit, "");
+        refreshWatchWin();
+    } else {
+        msgAppend((std::string("! Watch: не могу разрешить '") + s + "'").c_str());
+    }
+}
+
+static void showDisWin(HWND parent) {
+    if (!parent) parent = g_main;
+    if (!g_disWin) {
+        registerToolWin("AVRCLI_DisWin", ToolWinProc<2>);
+        g_disWin = CreateWindowExA(WS_EX_TOOLWINDOW, "AVRCLI_DisWin", "Disassembler",
+            WS_POPUP | WS_CAPTION | WS_SIZEBOX | WS_SYSMENU, 60, 80, 560, 480,
+            parent, nullptr, GetModuleHandleA(nullptr), nullptr);
+        g_disList = CreateWindowExA(0, WC_LISTVIEWA, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
+            0, 0, 556, 450, g_disWin, (HMENU)(intptr_t)1, GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(g_disList, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+        LVCOLUMNA col = {0};
+        col.mask = LVCF_TEXT | LVCF_WIDTH;
+        col.cx = 70; col.pszText = (LPSTR)"Address";
+        SendMessageA(g_disList, LVM_INSERTCOLUMNA, 0, (LPARAM)&col);
+        col.cx = 56; col.pszText = (LPSTR)"Code";
+        SendMessageA(g_disList, LVM_INSERTCOLUMNA, 1, (LPARAM)&col);
+        col.cx = 400; col.pszText = (LPSTR)"Disassembly";
+        SendMessageA(g_disList, LVM_INSERTCOLUMNA, 2, (LPARAM)&col);
+        SendMessageA(g_disList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    }
+    ShowWindow(g_disWin, SW_SHOW);
+    if (!g_disBuilt) buildDisRows();
+    refreshDisWin();
+}
+
+// ------------------------------------------------------------ рефреш утилитных окон
+static void refreshMemWin() {
+    if (!g_memList || !g_coreInit) return;
+    int size = emuapi_sramSize();
+    if (size <= 0) return;
+    int nRows = (size + 15) / 16;
+    static int builtRows = 0;
+    if (nRows != builtRows) {
+        SendMessageA(g_memList, WM_SETREDRAW, FALSE, 0);
+        ListView_DeleteAllItems(g_memList);
+        for (int r = 0; r < nRows; r++) {
+            char addr0[16];
+            snprintf(addr0, sizeof(addr0), "0x%04X", r * 16);
+            LVITEMA ins = {0};
+            ins.mask = LVIF_TEXT; ins.iItem = r; ins.iSubItem = 0; ins.pszText = addr0;
+            SendMessageA(g_memList, LVM_INSERTITEMA, r, (LPARAM)&ins);
+        }
+        SendMessageA(g_memList, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_memList, nullptr, TRUE);
+        builtRows = nRows;
+    }
+    static char cell[16][8], aCol[24];
+    for (int r = 0; r < nRows; r++) {
+        LVITEMA it = {0};
+        it.mask = LVIF_TEXT; it.iItem = r; it.iSubItem = 0;
+        char ascii[18]; int na = 0;
+        for (int b = 0; b < 16; b++) {
+            int a = r * 16 + b;
+            if (a >= size) { cell[b][0] = 0; ascii[na++] = ' '; continue; }
+            uint8_t v = emuapi_readSram(a);
+            snprintf(cell[b], sizeof(cell[b]), "%02X", v);
+            ascii[na++] = (v >= 0x20 && v < 0x7F) ? (char)v : '.';
+        }
+        ascii[na] = 0;
+        snprintf(aCol, sizeof(aCol), "%s", ascii);
+        for (int b = 0; b < 16; b++) {
+            it.iSubItem = 1 + b; it.pszText = cell[b];
+            SendMessageA(g_memList, LVM_SETITEMTEXTA, r, (LPARAM)&it);
+        }
+        it.iSubItem = 17; it.pszText = aCol;
+        SendMessageA(g_memList, LVM_SETITEMTEXTA, r, (LPARAM)&it);
+    }
+}
+
+static void refreshWatchWin() {
+    if (!g_watchList || !g_coreInit) return;
+    for (size_t i = 0; i < g_watchItems.size(); i++) {
+        static char nv[64];
+        int a = g_watchItems[i].second;
+        uint8_t v = a >= 0 ? emuapi_readSram(a) : 0;
+        snprintf(nv, sizeof(nv), "%d (0x%02X)", v, v);
+        LVITEMA it = {0};
+        it.mask = LVIF_TEXT; it.iItem = (int)i; it.iSubItem = 1; it.pszText = nv;
+        SendMessageA(g_watchList, LVM_SETITEMTEXTA, (int)i, (LPARAM)&it);
+    }
+}
+
+static void refreshDisWin() {
+    if (!g_disList || !g_coreInit) return;
+    int pc = (int)emuapi_pc();
+    ListView_SetItemState(g_disList, pc, LVIS_FOCUSED | LVIS_DROPHILITED, LVIS_FOCUSED | LVIS_DROPHILITED);
+    ListView_EnsureVisible(g_disList, pc, FALSE);
+}
+
+static void buildDisRows() {
+    if (!g_disList || !g_coreInit) return;
+    SendMessageA(g_disList, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(g_disList);
+    int words = emuapi_flashEnd();
+    char addr[12], code[12];
+    for (int w = 0; w < words; w++) {
+        uint16_t word = emuapi_flashWord(w);
+        if (w > 0 && word == 0xFFFF) break;   // конец программы (после линковки - 0xFFFF)
+        uint16_t next = (w + 1 < words) ? emuapi_flashWord(w + 1) : 0;
+        std::string txt = emuapi_decodeOp(word);
+        int wlen = (txt.find("+") != std::string::npos || txt.find("CALL") != std::string::npos) ? 2 : 1;
+        snprintf(addr, sizeof(addr), "0x%04X", w * 2);
+        snprintf(code, sizeof(code), "%04X", word);
+        std::string full = txt;
+        if (wlen == 2) full += "  (2 words)";
+        LVITEMA it = {0};
+        it.mask = LVIF_TEXT; it.iItem = w; it.pszText = addr;
+        SendMessageA(g_disList, LVM_INSERTITEMA, w, (LPARAM)&it);
+        it.iSubItem = 1; it.pszText = code;
+        SendMessageA(g_disList, LVM_SETITEMTEXTA, w, (LPARAM)&it);
+        static char row[256];
+        snprintf(row, sizeof(row), "%s %s", full.c_str(), (wlen == 2) ? hex4(next).c_str() : "");
+        it.iSubItem = 2; it.pszText = row;
+        SendMessageA(g_disList, LVM_SETITEMTEXTA, w, (LPARAM)&it);
+    }
+    SendMessageA(g_disList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_disList, nullptr, TRUE);
+    g_disBuilt = true;
+}
+
 // worker-поток прогона (F5): завершение уведомляет главное окно
-static DWORD WINAPI runThreadProc(LPVOID) {    emuapi_run();
+static DWORD WINAPI runThreadProc(LPVOID) {
+    emuapi_run();
     g_runBusy = false;
     if (g_main) PostMessageA(g_main, WM_APP + 1, 0, 0);
     return 0;
@@ -553,7 +825,9 @@ static void startDebugging() {
                    "  F_CPU=" + std::to_string(emuapi_fcpu()) + " Hz").c_str());
     }
     if (!emuapi_loaded() && !emuapi_load()) return;
+    g_disBuilt = false;           // новая программа - дизассемблер строится заново
     msgAppend("-- Debugging started (SIMULATOR)");
+    if (g_disWin && IsWindowVisible(g_disWin)) buildDisRows();
 }
 
 // ------------------------------------------------------------------ Status
@@ -1484,9 +1758,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     SetFocus(g_editMain);
                     return 0;
                 // ---- View ----
-                case IDM_VIEW_PROC:
-                    showProcWin(h);
-                    return 0;
+                case IDM_VIEW_PROC: showProcWin(h); return 0;
+                case IDM_VIEW_REG:  showProcWin(h); return 0;   // Register-окно = Processor-список (M6)
+                case IDM_VIEW_MEM:  showMemWin(h);  return 0;
+                case IDM_VIEW_WATCH:showWatchWin(h);return 0;
+                case IDM_VIEW_DISASM: showDisWin(h); return 0;
                 case IDM_VIEW_BUILDOUT: outShowPage(0); return 0;
                 case IDM_VIEW_MSGOUT:   outShowPage(1); return 0;
                 case IDM_VIEW_FINDOUT:  outShowPage(2); return 0;

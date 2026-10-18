@@ -2531,7 +2531,27 @@ uint8_t  emuapi_sreg() {
 uint16_t emuapi_sp() { return (uint16_t)(g_dmem[0x5D] | (g_dmem[0x5E] << 8)); }
 const char* emuapi_chip() { return g_chip.c_str(); }
 unsigned    emuapi_fcpu() { return g_fcpu; }
+// Доступ к [RegisterMap] текущего чипа для I/O View GUI: отсортирован по имени.
+int emuapi_regCount() { return (int)g_regmap.size(); }
+void emuapi_regAt(int i, char* buf, int bufsz, int* sramAddr) {
+    if (i < 0 || i >= (int)g_regmap.size()) { if (bufsz) *buf = 0; if (sramAddr) *sramAddr = -1; return; }
+    auto it = g_regmap.begin();
+    std::advance(it, i);
+    snprintf(buf, bufsz, "%s", it->first.c_str());
+    if (sramAddr) *sramAddr = it->second;
+}
+// Экспорт карты регистров одним блоком: "name addr\n"... (для постройки I/O View GUI)
+std::string emuapi_regMapText() {
+    std::string out;
+    for (auto& kv : g_regmap) out += kv.first + " " + std::to_string(kv.second) + "\n";
+    return out;
+}
 std::string emuapi_tioText() {
     return g_tioTx.size() > 8192 ? g_tioTx.substr(g_tioTx.size() - 8192) : g_tioTx;
 }
+int emuapi_sramSize() { return (int)g_dmem.size(); }
+bool emuapi_findSymbol(const char* name, uint32_t* addr) { return findSymbol(name, *addr); }
+int      emuapi_flashEnd()   { return (int)(FLASH_END / 2); }
+uint16_t emuapi_flashWord(int w) { return (w >= 0 && w * 2L < (int)FLASH_END) ? flashWord(w) : 0xFFFF; }
+std::string emuapi_decodeOp(uint16_t word) { return decodeOp(word); }
 #endif // EMU_LIB

@@ -25,3 +25,12 @@ uint16_t emuapi_sp();
 const char* emuapi_chip();
 unsigned    emuapi_fcpu();
 std::string emuapi_tioText();                           // Terminal I/O: собранное UART-TX
+// [RegisterMap] текущего чипа: список имён+SRAM-адресов для I/O View GUI
+int      emuapi_regCount();
+void     emuapi_regAt(int i, char* buf, int bufsz, int* sramAddr);
+std::string emuapi_regMapText();                        // "название адрес\n" ... одним блоком
+int      emuapi_sramSize();                             // размер SRAM (для окна Memory)
+bool     emuapi_findSymbol(const char* name, uint32_t* addr); // символ из ELF/DWARF -> адрес
+int      emuapi_flashEnd();                             // длина FLASH в словах
+uint16_t emuapi_flashWord(int w);                        // слово FLASH
+std::string emuapi_decodeOp(uint16_t word);              // дизассемблер слова
