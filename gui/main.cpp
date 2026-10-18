@@ -44,6 +44,12 @@ enum {
     IDM_VIEW_STATUS, IDM_VIEW_DISASM, IDM_VIEW_WATCH, IDM_VIEW_MEM, IDM_VIEW_MEM2,
     IDM_VIEW_MEM3, IDM_VIEW_REG, IDM_VIEW_IO, IDM_VIEW_PROC,
     IDM_VIEW_BUILDOUT, IDM_VIEW_MSGOUT, IDM_VIEW_FINDOUT, IDM_VIEW_BREAKS,
+    // Edit (скрин 9/12: Undo/Redo/Cut/Copy/Paste/Delete/SelectAll/Bookmarks)
+    IDM_EDIT_UNDO = 1420, IDM_EDIT_REDO, IDM_EDIT_CUT, IDM_EDIT_COPY, IDM_EDIT_PASTE,
+    IDM_EDIT_DELETE, IDM_EDIT_SELALL, IDM_EDIT_BMTGGL, IDM_EDIT_BMPREV, IDM_EDIT_BMNEXT,
+    IDM_EDIT_BMRMALL,
+    // Window (каскад/тайлинг/список окон)
+    IDM_WIN_CASCADE = 1440, IDM_WIN_TILEH, IDM_WIN_TILEV, IDM_WIN_ARRANGE, IDM_WIN_LIST,
     // Tools
     IDM_TOOLS_AVRPROG = 1400, IDM_TOOLS_CUSTOM, IDM_TOOLS_OPTIONS, IDM_TOOLS_KEYS,
     IDM_TOOLS_PLUGIN, IDM_TOOLS_PROG_CONNECT, IDM_TOOLS_PROGP_AUTO, IDM_TOOLS_PROGP_FLASH,
@@ -61,11 +67,67 @@ enum {
 };
 
 static HWND g_main = 0, g_ioTree = 0, g_ioList = 0, g_msgs = 0, g_status = 0;
-static HWND g_tbStd = 0, g_tbDbg = 0, g_tabMsg = 0, g_editMain = 0;
+static HWND g_tbStd = 0, g_tbDbg = 0, g_editMain = 0;
+// Dock Workspace слева (скрин 7) и нижняя зона вывода со вкладками снизу (скрин 15)
+static HWND g_wsCap = 0, g_wsTree = 0, g_wsTabs = 0, g_wsList = 0;
+static HWND g_outCap = 0, g_outTabs = 0, g_buildEdit = 0, g_findEdit = 0, g_bpList = 0;
+static std::vector<std::string> g_wsFiles;       // пути файлов дерева Workspace
+static int g_outPage = 1;                        // активная страница вывода: 0 Build 1 Message 2 Find 3 BP
 static HFONT g_fontUi = 0;
 
-static void tbAddStr(HWND tb, int id, const char* text, int sep) {
-    TBBUTTON b = {0};
+// ------------------------------------------------------------ Caption-панель дока
+// Синяя строка заголовка дока как в AS4 (скрин 15): слева имя, справа ▼ и ✕
+static LRESULT CALLBACK CapProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(h, &ps);
+            RECT r; GetClientRect(h, &r);
+            HBRUSH blue = CreateSolidBrush(RGB(0, 102, 204));
+            FillRect(dc, &r, blue);
+            DeleteObject(blue);
+            RECT leftCol = { r.left, r.top, r.left + 4, r.bottom };   // тёмный якорь слева, как у AS4
+            HBRUSH dark = CreateSolidBrush(RGB(0, 64, 143));
+            FillRect(dc, &leftCol, dark);
+            DeleteObject(dark);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(255, 255, 255));
+            SelectObject(dc, (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+            char text[128]; GetWindowTextA(h, text, sizeof(text));
+            RECT tr = { r.left + 8, r.top, r.right - 44, r.bottom };
+            DrawTextA(dc, text, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            // справа ▼ и ✕ (рисуем сами, ANSI DrawText кириллические glyфы не даст)
+            POINT tri[3] = { {r.right-34, r.top+8}, {r.right-24, r.top+8}, {r.right-29, r.top+14} };
+            HBRUSH wb = CreateSolidBrush(RGB(255,255,255));
+            HPEN noPen = (HPEN)GetStockObject(NULL_PEN);
+            HGDIOBJ op = SelectObject(dc, noPen), ob = SelectObject(dc, wb);
+            Polygon(dc, tri, 3);
+            SelectObject(dc, op); SelectObject(dc, ob);
+            DeleteObject(wb);
+            HPEN wp = CreatePen(PS_SOLID, 1, RGB(255,255,255));
+            HGDIOBJ open_ = SelectObject(dc, wp);
+            int cxm = r.right - 14, cym = r.top + 10;
+            MoveToEx(dc, cxm - 4, cym - 4, 0); LineTo(dc, cxm + 4, cym + 4);
+            MoveToEx(dc, cxm + 4, cym - 4, 0); LineTo(dc, cxm - 4, cym + 4);
+            SelectObject(dc, open_);
+            DeleteObject(wp);
+            EndPaint(h, &ps);
+            return 0;
+        }
+    }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static void registerCapClass() {
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = CapProc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = "AVRCLI_Cap";
+    wc.hCursor = LoadCursorA(nullptr, (LPCSTR)IDC_ARROW);
+    RegisterClassA(&wc);
+}
+
+static void tbAddStr(HWND tb, int id, const char* text, int sep) {    TBBUTTON b = {0};
     b.iBitmap = 0;
     b.idCommand = id;
     b.fsState = TBSTATE_ENABLED;
@@ -189,10 +251,10 @@ static HWND g_procWin = nullptr, g_procList = nullptr;
 static bool g_procItems = false;      // имена строк уже заполнены
 
 static void procSetItem(int idx, const char* text) {
-    if (!g_procList) return;
     LVITEMA it = {0};
     it.mask = LVIF_TEXT; it.iItem = idx; it.iSubItem = 1; it.pszText = (LPSTR)text;
-    SendMessageA(g_procList, LVM_SETITEMTEXTA, idx, (LPARAM)&it);
+    if (g_procList) SendMessageA(g_procList, LVM_SETITEMTEXTA, idx, (LPARAM)&it);
+    if (g_wsList && IsWindowVisible(g_wsList)) SendMessageA(g_wsList, LVM_SETITEMTEXTA, idx, (LPARAM)&it);
 }
 
 static LRESULT CALLBACK ProcWinProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -210,7 +272,9 @@ static LRESULT CALLBACK ProcWinProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static void refreshProcWin() {
-    if (!g_procWin || !g_coreInit) return;
+    if (!g_coreInit) return;
+    bool wsListVis = g_wsList && IsWindowVisible(g_wsList);
+    if (!g_procWin && !wsListVis) return;
     char t[64];
     // X = R26:R27, Y = R28:R29, Z = R30:R31 (регистры_file лежит в SRAM 0..31)
     uint16_t xv = (uint16_t)(emuapi_readSram(26) | (emuapi_readSram(27) << 8));
@@ -479,6 +543,9 @@ static void loadRecent() {
 }
 
 // открыть проект: dir с echo.ctos
+static void fillWorkspaceTree();          // дерево проекта слева (скрин 7), реализация ниже
+static void addProcRowsOnce(HWND list);   // строки Processor-таблицы (скрин 16)
+
 static void openProjectAt(const std::string& projDir) {
     auto cfg = readCtos(projDir);
     g_projRoot = projDir;
@@ -493,6 +560,7 @@ static void openProjectAt(const std::string& projDir) {
     statusSet(0, g_deviceName.c_str());
     msgAppend((std::string("Project opened: ") + projDir).c_str());
     msgAppend((std::string("Device: " + g_deviceName + "  (mcu=" + g_mcuName + ")").c_str()));
+    fillWorkspaceTree();
 }
 
 static std::string folderNameOf(const std::string& p) {
@@ -500,6 +568,102 @@ static std::string folderNameOf(const std::string& p) {
     while (!s.empty() && (s.back() == '\\' || s.back() == '/')) s.pop_back();
     size_t sl = s.find_last_of("\\/");
     return sl != std::string::npos ? s.substr(sl + 1) : s;
+}
+
+// ------------------------------------------------------------ Dock Workspace
+// Дерево проекта как в AS4 (скрин 7): "<имя> (default)" -> Source/Header/External Deps/Other Files
+static HTREEITEM tvAdd(HWND tv, HTREEITEM parent, const char* text, LPARAM lp) {
+    TVINSERTSTRUCTA is = {0};
+    is.hParent = parent;
+    is.hInsertAfter = TVI_LAST;
+    is.item.mask = TVIF_TEXT | (lp ? TVIF_PARAM : 0);
+    is.item.pszText = (LPSTR)text;
+    is.item.lParam = lp;
+    return (HTREEITEM)SendMessageA(tv, TVM_INSERTITEMA, 0, (LPARAM)&is);
+}
+
+static void fillWorkspaceTree() {
+    if (!g_wsTree) return;
+    SendMessageA(g_wsTree, WM_SETREDRAW, FALSE, 0);
+    TreeView_DeleteAllItems(g_wsTree);
+    g_wsFiles.clear();
+    if (!g_projOpen) {
+        SendMessageA(g_wsTree, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_wsTree, nullptr, TRUE);
+        return;
+    }
+    HTREEITEM root = tvAdd(g_wsTree, TVI_ROOT, (folderNameOf(g_projRoot) + " (default)").c_str(), 0);
+    // исходники: main.c / main.asm
+    HTREEITEM nSrc = tvAdd(g_wsTree, root, "Source Files", 0);
+    g_wsFiles.clear();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((g_projRoot + "/*.c").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            std::string path = g_projRoot + "/" + fd.cFileName;
+            g_wsFiles.push_back(path);
+            tvAdd(g_wsTree, nSrc, fd.cFileName, (LPARAM)g_wsFiles.size());  // 1-based индекс
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    h = FindFirstFileA((g_projRoot + "/*.asm").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            std::string path = g_projRoot + "/" + fd.cFileName;
+            g_wsFiles.push_back(path);
+            tvAdd(g_wsTree, nSrc, fd.cFileName, (LPARAM)g_wsFiles.size());
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    tvAdd(g_wsTree, root, "Header Files", 0);
+    tvAdd(g_wsTree, root, "External Dependencies", 0);
+    HTREEITEM nOther = tvAdd(g_wsTree, root, "Other Files", 0);
+    const char* others[] = { "echo.ctos", "project.avrs" };
+    for (const char* o : others)
+        if (fileExists(g_projRoot + "/" + o)) {
+            g_wsFiles.push_back(g_projRoot + "/" + o);
+            tvAdd(g_wsTree, nOther, o, (LPARAM)g_wsFiles.size());
+        }
+    SendMessageA(g_wsTree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_wsTree, nullptr, TRUE);
+    TreeView_Expand(g_wsTree, root, TVE_EXPAND);
+    TreeView_Expand(g_wsTree, nSrc, TVE_EXPAND);      // как в AS4: main.c виден сразу (скрин 7)
+    TreeView_Expand(g_wsTree, nOther, TVE_EXPAND);
+}
+
+// ------------------------------------------------------------ Страницы нижней зоны
+// 0 Build / 1 Message / 2 Find in Files / 3 Breakpoints (скрин 15) + вкладки СНИЗУ
+static HWND outPageWnd(int page) {
+    switch (page) {
+        case 0: return g_buildEdit;
+        case 2: return g_findEdit;
+        case 3: return g_bpList;
+        default: return g_msgs;
+    }
+}
+
+static const char* outPageName(int page) {
+    const char* names[4] = { "Build", "Message", "Find in Files", "Breakpoints and Tracepoints" };
+    return names[page];
+}
+
+static void outShowPage(int page) {
+    if (page < 0 || page > 3 || !g_outTabs) return;
+    g_outPage = page;
+    for (int i = 0; i < 4; i++)
+        ShowWindow(outPageWnd(i), i == page ? SW_SHOW : SW_HIDE);
+    SendMessageA(g_outTabs, TCM_SETCURSEL, page, 0);
+    SetWindowTextA(g_outCap, outPageName(page));
+}
+
+// вкладка Workspace: 0 AVR GCC (дерево) / 1 Processor (список значений, как скрин 16)
+static void wsShowTab(int page) {
+    if (!g_wsTabs) return;
+    ShowWindow(g_wsTree, page == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_wsList, page == 1 ? SW_SHOW : SW_HIDE);
+    SendMessageA(g_wsTabs, TCM_SETCURSEL, page, 0);
+    SetWindowTextA(g_wsCap, page == 0 ? "AVR GCC" : "Processor");
+    if (page == 1) refreshProcWin();
 }
 
 // --------------------------------------------------- Портативный режим
@@ -595,6 +759,28 @@ static bool createProject(HWND h) {
 // сборка проекта через avr-gcc (скрин 8, Build-меню AS4); вывод -> Message
 static void msgAppendStr(const std::string& s) { msgAppend(s.c_str()); }
 
+// зеркало вывода сборки в страницу Build нижней зоны (скрин 15)
+static void msgAndBuild(const char* s) {
+    // Message-панель
+    int n = GetWindowTextLengthA(g_msgs);
+    if (n < 0) n = 0;
+    std::string cur(n, 0);
+    if (n > 0) SendMessageA(g_msgs, WM_GETTEXT, n + 1, (LPARAM)&cur[0]);
+    if (n > 0 && !cur.empty() && cur.back() != '\n') cur += "\r\n";
+    cur += s;
+    SendMessageA(g_msgs, WM_SETTEXT, 0, (LPARAM)cur.c_str());
+    // страница Build
+    if (g_buildEdit) {
+        int m = GetWindowTextLengthA(g_buildEdit);
+        if (m < 0) m = 0;
+        std::string cur2(m, 0);
+        if (m > 0) SendMessageA(g_buildEdit, WM_GETTEXT, m + 1, (LPARAM)&cur2[0]);
+        if (m > 0 && !cur2.empty() && cur2.back() != '\n') cur2 += "\r\n";
+        cur2 += s;
+        SendMessageA(g_buildEdit, WM_SETTEXT, 0, (LPARAM)cur2.c_str());
+    }
+}
+
 static void runToolAppend(const std::string& cmdline, const std::string& cwd) {
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
     HANDLE rPipe = nullptr, wPipe = nullptr;
@@ -614,14 +800,14 @@ static void runToolAppend(const std::string& cmdline, const std::string& cwd) {
     std::string out;
     while (ReadFile(rPipe, buf, sizeof(buf) - 1, &n, nullptr) && n > 0) {
         buf[n] = 0; out += buf;
-        if (out.size() > 65536) { msgAppend(out.c_str()); out.clear(); }
+        if (out.size() > 65536) { msgAndBuild(out.c_str()); out.clear(); }
     }
     CloseHandle(rPipe);
-    if (!out.empty()) msgAppendStr(out);
+    if (!out.empty()) msgAndBuild(out.c_str());
     DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    msgAppendStr((std::string(code ? "! Build FAILED (code=" : "Build OK (code=") +
-               std::to_string((DWORD)code) + ")"));
+    msgAndBuild((std::string(code ? "! Build FAILED (code=" : "Build OK (code=") +
+               std::to_string((DWORD)code) + ")").c_str());
 }
 
 static void buildProject(bool andRun) {
@@ -962,18 +1148,53 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int statusH = 0;
             RECT rs; GetWindowRect(g_status, &rs); statusH = rs.bottom - rs.top;
             int cx = LOWORD(l), cy = HIWORD(l);
+            int leftW   = 230;   // Workspace-док (скрин 7)
             int rightW  = 240;   // I/O View док
-            int bottomH = 170;   // Message панель
+            int bottomH = 170;   // нижняя зона вывода (скрин 15)
             int workH = cy - yTop - statusH;
-            int bottomY = cy - statusH - bottomH;
+            int contentH = workH - bottomH;      // высота зоны редактор/доки
+            int capH = 20, tabsH = 26;
+            // нижняя зона вывода на всю ширину окна (скрин 15: вкладки у нижней кромки)
+            int bY = yTop + contentH;
+            MoveWindow(g_outCap,    0, bY, cx, capH, TRUE);
+            int cH = bottomH - capH - tabsH;
+            MoveWindow(g_msgs,      0, bY + capH, cx, cH, TRUE);
+            MoveWindow(g_buildEdit, 0, bY + capH, cx, cH, TRUE);
+            MoveWindow(g_findEdit,  0, bY + capH, cx, cH, TRUE);
+            MoveWindow(g_bpList,    0, bY + capH, cx, cH, TRUE);
+            MoveWindow(g_outTabs,   0, cy - statusH - tabsH, cx, tabsH, TRUE);
+            // Workspace-док слева (дерево проекта / процессорный список)
+            MoveWindow(g_wsCap,  0, yTop, leftW, capH, TRUE);
+            int wsH = contentH - capH - 24;
+            MoveWindow(g_wsTree, 0, yTop + capH, leftW, wsH, TRUE);
+            MoveWindow(g_wsList, 0, yTop + capH, leftW, wsH, TRUE);
+            MoveWindow(g_wsTabs, 0, yTop + contentH - 24, leftW, 24, TRUE);
             // центральный редактор
-            MoveWindow(g_editMain, 0, yTop, cx - rightW, workH - bottomH, TRUE);
+            MoveWindow(g_editMain, leftW, yTop, cx - leftW - rightW, contentH, TRUE);
             // правый док: сверху модули, снизу регистры
-            MoveWindow(g_ioTree, cx - rightW, yTop, rightW, (workH - bottomH) / 2, TRUE);
-            MoveWindow(g_ioList, cx - rightW, yTop + (workH - bottomH) / 2, rightW, (workH - bottomH) / 2, TRUE);
-            // нижняя Message-панель: таб + вывод (скрин 15: Build/Message/Find in Files/Breakpoints)
-            MoveWindow(g_tabMsg, 0, bottomY, cx - rightW, bottomH, TRUE);
-            MoveWindow(g_msgs, 3, 26, cx - rightW - 6, bottomH - 30, TRUE);
+            int ioHalf = contentH / 2;
+            MoveWindow(g_ioTree, cx - rightW, yTop, rightW, ioHalf, TRUE);
+            MoveWindow(g_ioList, cx - rightW, yTop + ioHalf, rightW, contentH - ioHalf, TRUE);
+            return 0;
+        }
+        case WM_NOTIFY: {
+            NMHDR* nm = (NMHDR*)l;
+            if (nm->code == TCN_SELCHANGE && nm->hwndFrom == g_outTabs)
+                outShowPage((int)SendMessageA(g_outTabs, TCM_GETCURSEL, 0, 0));
+            else if (nm->code == TCN_SELCHANGE && nm->hwndFrom == g_wsTabs)
+                wsShowTab((int)SendMessageA(g_wsTabs, TCM_GETCURSEL, 0, 0));
+            else if (nm->code == NM_DBLCLK && nm->hwndFrom == g_wsTree) {
+                HTREEITEM sel = TreeView_GetSelection(g_wsTree);
+                if (sel) {
+                    TVITEMA ti = {0};
+                    ti.mask = TVIF_PARAM; ti.hItem = sel;
+                    if (TreeView_GetItem(g_wsTree, &ti) && ti.lParam > 0) {
+                        int idx = (int)ti.lParam - 1;
+                        if (idx >= 0 && idx < (int)g_wsFiles.size())
+                            loadEditorFromFile(g_wsFiles[idx]);
+                    }
+                }
+            }
             return 0;
         }
         case WM_COMMAND: {
@@ -1054,10 +1275,38 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                         else msgAppend("-- Cleaned: main.elf не найден");
                     }
                     return 0;
+                // ---- Edit ----
+                case IDM_EDIT_UNDO:   SendMessageA(g_editMain, WM_UNDO, 0, 0); return 0;
+                case IDM_EDIT_REDO:   SendMessageA(g_editMain, 0x030B, 0, 0); return 0;  // EM_REDO
+                case IDM_EDIT_CUT:    SendMessageA(g_editMain, WM_CUT, 0, 0); return 0;
+                case IDM_EDIT_COPY:   SendMessageA(g_editMain, WM_COPY, 0, 0); return 0;
+                case IDM_EDIT_PASTE:  SendMessageA(g_editMain, WM_PASTE, 0, 0); return 0;
+                case IDM_EDIT_DELETE: SendMessageA(g_editMain, WM_CLEAR, 0, 0); return 0;
+                case IDM_EDIT_SELALL: SendMessageA(g_editMain, EM_SETSEL, 0, -1); return 0;
+                case IDM_EDIT_BMTGGL:
+                case IDM_EDIT_BMPREV:
+                case IDM_EDIT_BMNEXT:
+                case IDM_EDIT_BMRMALL:
+                    msgAppend("-- Bookmarks: заглушка, реализуются в следующей вехе");
+                    return 0;
+                // ---- Window ----
+                case IDM_WIN_CASCADE:
+                case IDM_WIN_TILEH:
+                case IDM_WIN_TILEV:
+                case IDM_WIN_ARRANGE:
+                    msgAppend("-- Window layout: единое окно редактора (MDI-дочки появятся в следующей вехе)");
+                    return 0;
+                case IDM_WIN_LIST:
+                    SetFocus(g_editMain);
+                    return 0;
                 // ---- View ----
                 case IDM_VIEW_PROC:
                     showProcWin(h);
                     return 0;
+                case IDM_VIEW_BUILDOUT: outShowPage(0); return 0;
+                case IDM_VIEW_MSGOUT:   outShowPage(1); return 0;
+                case IDM_VIEW_FINDOUT:  outShowPage(2); return 0;
+                case IDM_VIEW_BREAKS:   outShowPage(3); return 0;
                 // ---- File ----
                 case IDM_FILE_SAVE:
                 case IDM_FILE_SAVEALL:
@@ -1089,6 +1338,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     g_appDir = exeDirNow();
     loadRecent();
     ensurePortableProcs();
+    registerCapClass();
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES
         | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
@@ -1109,13 +1359,38 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     HMENU mb = CreateMenu();
     {   HMENU mFile = CreateMenu(), mProj = CreateMenu(), mBuild = CreateMenu();
         HMENU mView = CreateMenu(), mTools = CreateMenu(), mDbg = CreateMenu(), mHelp = CreateMenu();
+        HMENU mEdit = CreateMenu(), mWin = CreateMenu();
         AppendMenuA(mb, MF_POPUP, (UINT_PTR)mFile,  "&File");
         AppendMenuA(mb, MF_POPUP, (UINT_PTR)mProj,  "&Project");
         AppendMenuA(mb, MF_POPUP, (UINT_PTR)mBuild, "&Build");
+        AppendMenuA(mb, MF_POPUP, (UINT_PTR)mEdit,  "&Edit");
         AppendMenuA(mb, MF_POPUP, (UINT_PTR)mView,  "&View");
         AppendMenuA(mb, MF_POPUP, (UINT_PTR)mTools, "&Tools");
         AppendMenuA(mb, MF_POPUP, (UINT_PTR)mDbg,   "&Debug");
+        AppendMenuA(mb, MF_POPUP, (UINT_PTR)mWin,   "&Window");
         AppendMenuA(mb, MF_POPUP, (UINT_PTR)mHelp,  "&Help");
+        // Edit (скрин 9/12: Undo/Redo/Cut/Copy/Paste/Delete/Select All/Bookmarks)
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_UNDO,   "&Undo\tCtrl+Z");
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_REDO,   "&Redo\tCtrl+Y");
+        AppendMenuA(mEdit, MF_SEPARATOR, 0, 0);
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_CUT,    "Cu&t\tCtrl+X");
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_COPY,   "&Copy\tCtrl+C");
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_PASTE,  "&Paste\tCtrl+V");
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_DELETE, "De&lete\tDel");
+        AppendMenuA(mEdit, MF_SEPARATOR, 0, 0);
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_SELALL, "Select A&ll\tCtrl+A");
+        AppendMenuA(mEdit, MF_SEPARATOR, 0, 0);
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_BMTGGL, "Toggle Bookmark\tCtrl+F2");
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_BMPREV, "Previous Bookmark\tShift+F2");
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_BMNEXT, "Next Bookmark\tF2");
+        AppendMenuA(mEdit, MF_STRING, IDM_EDIT_BMRMALL,"Remove All Bookmarks");
+        // Window (каскад/тайлинг и список открытых окон)
+        AppendMenuA(mWin, MF_STRING, IDM_WIN_CASCADE, "&Cascade");
+        AppendMenuA(mWin, MF_STRING, IDM_WIN_TILEH,  "Tile &Horizontal");
+        AppendMenuA(mWin, MF_STRING, IDM_WIN_TILEV,  "Tile &Vertical");
+        AppendMenuA(mWin, MF_STRING, IDM_WIN_ARRANGE,"&Arrange Icons");
+        AppendMenuA(mWin, MF_SEPARATOR, 0, 0);
+        AppendMenuA(mWin, MF_STRING | MF_CHECKED, IDM_WIN_LIST, "&1 AVR Studio (current)");
         // File (скрин 9: New File/Open File/Close/Save/Save As.../Save All/Print/Print Setup/Exit)
         AppendMenuA(mFile, MF_STRING, IDM_FILE_NEW,        "&New File\tCtrl+N");
         AppendMenuA(mFile, MF_STRING, IDM_FILE_OPEN,       "&Open File...\tCtrl+O");
@@ -1252,16 +1527,50 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
       lv.pszText = (LPSTR)"Bits";   lv.cx = 60; ListView_InsertColumn(g_ioList, 3, &lv); }
     fillIoTree(g_ioTree);
 
-    // --- Message панель (нижний док, скрин 15): таб + вывод
-    g_tabMsg = CreateWindowExA(WS_EX_CLIENTEDGE, WC_TABCONTROLA, 0,
-        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 700, 170, g_main, (HMENU)206, hInst, 0);
+    // --- Нижняя зона вывода (скрин 15): caption сверху + страницы + вкладки СНИЗУ
+    g_outCap = CreateWindowExA(0, "AVRCLI_Cap", "Message",
+        WS_CHILD | WS_VISIBLE, 0, 0, 700, 20, g_main, (HMENU)231, hInst, 0);
+    g_outTabs = CreateWindowExA(WS_EX_CLIENTEDGE, WC_TABCONTROLA, 0,
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_BOTTOM, 0, 0, 700, 26, g_main, (HMENU)232, hInst, 0);
     { TCITEMA ti = {0}; ti.mask = TCIF_TEXT;
       const char* tabs[4] = {"Build", "Message", "Find in Files", "Breakpoints and Tracepoints"};
-      for (int i = 0; i < 4; i++) { ti.pszText = (LPSTR)tabs[i]; SendMessageA(g_tabMsg, TCM_INSERTITEMA, i, (LPARAM)&ti); }
-      SendMessageA(g_tabMsg, TCM_SETCURSEL, 1, 0); }
-    g_msgs = CreateWindowExA(0, "EDIT", "Loaded plugin STK500\r\nLoaded plugin AVR GCC\r\nLoaded partfile: ATmega8.xml\r\n",
-        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
-        3, 26, 700, 140, g_tabMsg, (HMENU)203, hInst, 0);
+      for (int i = 0; i < 4; i++) { ti.pszText = (LPSTR)tabs[i]; SendMessageA(g_outTabs, TCM_INSERTITEMA, i, (LPARAM)&ti); }
+      SendMessageA(g_outTabs, TCM_SETCURSEL, 1, 0); }
+    g_msgs = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "Loaded plugin STK500\r\nLoaded plugin AVR GCC\r\nLoaded partfile: ATmega8.xml\r\nProject is ready and can be saved\r\n",
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+        0, 0, 700, 140, g_main, (HMENU)203, hInst, 0);
+    g_buildEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+        WS_CHILD | WS_CLIPSIBLINGS | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+        0, 0, 700, 140, g_main, (HMENU)237, hInst, 0);
+    g_findEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+        WS_CHILD | WS_CLIPSIBLINGS | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+        0, 0, 700, 140, g_main, (HMENU)238, hInst, 0);
+    g_bpList = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, 0,
+        WS_CHILD | WS_CLIPSIBLINGS | LVS_REPORT | LVS_SHOWSELALWAYS,
+        0, 0, 700, 140, g_main, (HMENU)239, hInst, 0);
+    { LVCOLUMNA lv = {0}; lv.mask = LVCF_TEXT | LVCF_WIDTH; lv.pszText = (LPSTR)"Description"; lv.cx = 420;
+      ListView_InsertColumn(g_bpList, 0, &lv);
+      lv.pszText = (LPSTR)"Hit Count"; lv.cx = 90; ListView_InsertColumn(g_bpList, 1, &lv); }
+
+    // --- Dock Workspace слева (скрин 7): дерево проекта, вкладки AVR GCC|Processor снизу
+    g_wsCap = CreateWindowExA(0, "AVRCLI_Cap", "AVR GCC",
+        WS_CHILD | WS_VISIBLE, 0, 0, 230, 20, g_main, (HMENU)225, hInst, 0);
+    g_wsTree = CreateWindowExA(WS_EX_CLIENTEDGE, WC_TREEVIEWA, 0,
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS,
+        0, 0, 230, 500, g_main, (HMENU)226, hInst, 0);
+    g_wsList = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, 0,
+        WS_CHILD | WS_CLIPSIBLINGS | LVS_REPORT, 0, 0, 230, 500, g_main, (HMENU)228, hInst, 0);
+    { LVCOLUMNA lv = {0}; lv.mask = LVCF_TEXT | LVCF_WIDTH; lv.pszText = (LPSTR)"Name"; lv.cx = 120;
+      SendMessageA(g_wsList, LVM_INSERTCOLUMNA, 0, (LPARAM)&lv);
+      lv.pszText = (LPSTR)"Value"; lv.cx = 90;
+      SendMessageA(g_wsList, LVM_INSERTCOLUMNA, 1, (LPARAM)&lv);
+      SendMessageA(g_wsList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+      addProcRowsOnce(g_wsList); }
+    g_wsTabs = CreateWindowExA(WS_EX_CLIENTEDGE, WC_TABCONTROLA, 0,
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_BOTTOM, 0, 0, 230, 24, g_main, (HMENU)227, hInst, 0);
+    { TCITEMA ti = {0}; ti.mask = TCIF_TEXT;
+      ti.pszText = (LPSTR)"AVR GCC"; SendMessageA(g_wsTabs, TCM_INSERTITEMA, 0, (LPARAM)&ti);
+      ti.pszText = (LPSTR)"Processor"; SendMessageA(g_wsTabs, TCM_INSERTITEMA, 1, (LPARAM)&ti); }
 
     // --- Статусбар (скрин 1: CAP NUM OVR/, скрин 7: устройство | платформа | режим)
     g_status = CreateWindowExA(0, STATUSCLASSNAMEA, 0,
