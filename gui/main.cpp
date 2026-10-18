@@ -10,6 +10,7 @@
 #include <string>
 #include <map>
 #include <vector>
+#include <algorithm>
 #include <atomic>
 
 #include "emu_api.h"   // ядро эмулятора встроено в процесс (build/emu.cpp, EMU_LIB)
@@ -321,31 +322,14 @@ static void tbSep(HWND tb) {
 }
 
 // ---------------------------------------------------------------- I/O View
-// Модули и регистры AVR Studio 'part description' - сейчас зеркалим ATmega8
-// (скрины 7/18-25); позже заполняется из [RegisterMap] профиля чипа.
-struct IoReg { const char* name; int ioAddr; };
-struct IoModule { const char* name; const IoReg* regs; int nRegs; };
+// Модули и регистры из [RegisterMap] профиля чипа (скрины 7/18-19):
+// дерево модулей (полные имена регистров), снизу список Name|Address|Value|Bits.
+struct GuiReg { std::string name, full; int ioAddr, sramAddr; };
+static std::vector<GuiReg> g_ioRegs;
+static std::vector<std::pair<std::string, std::vector<int>>> g_ioMod;   // модуль -> индексы
+static bool g_coreInit;        // emuapi_init выполнен (определение в секции эмулятора)
 
-static const IoReg kCpuRegs[] = {
-    {"MCUCR", 0x35}, {"MCUCSR", 0x34}, {"OSCCAL", 0x31}, {"SFIOR", 0x30},
-    {"SP", 0x3D}, {"SPH", 0x3E}, {"SPL", 0x3D}, {"SPMCR", 0x37}, {"SREG", 0x3F},
-};
-static const IoModule kModules[] = {
-    {"AD_CONVERTER", 0, 0},
-    {"ANALOG_COMPARATOR", 0, 0},
-    {"CPU", kCpuRegs, 9},
-    {"EEPROM", 0, 0},
-    {"EXTERNAL_INTERRUPT", 0, 0},
-    {"PORTB", 0, 0}, {"PORTC", 0, 0}, {"PORTD", 0, 0},
-    {"SPI", 0, 0},
-    {"TIMER_COUNTER_0", 0, 0}, {"TIMER_COUNTER_1", 0, 0}, {"TIMER_COUNTER_2", 0, 0},
-    {"TWI", 0, 0}, {"USART", 0, 0}, {"WATCHDOG", 0, 0},
-};
-
-static WNDPROC g_treeProc = 0;
-static LRESULT CALLBACK TreeSubclass(HWND h, UINT m, WPARAM w, LPARAM l) {
-    return CallWindowProc(g_treeProc, h, m, w, l);
-}
+// AS4-полные имена основных регистров (словарь) — остальное правилами/<NAME> Register
 
 static void addTreeItem(HWND tv, HTREEITEM parent, const char* text, int image) {
     TVINSERTSTRUCTA tvi = {0};
@@ -358,24 +342,250 @@ static void addTreeItem(HWND tv, HTREEITEM parent, const char* text, int image) 
     TreeView_InsertItem(tv, &tvi);
 }
 
-static void fillIoTree(HWND tv) {
-    TreeView_DeleteAllItems(tv);
-    int nMod = sizeof(kModules)/sizeof(kModules[0]);
-    for (int m = 0; m < nMod; m++) {
-        // root-модуль (скрин 20: серая иконка藏族 + имя)
-        TVINSERTSTRUCTA tvi = {0};
-        tvi.hInsertAfter = TVI_LAST;
-        tvi.item.mask = TVIF_TEXT | TVIF_IMAGE | TVIF_SELECTEDIMAGE;
-        tvi.item.pszText = (LPSTR)kModules[m].name;
-        tvi.item.iImage = 0; tvi.item.iSelectedImage = 0;
-        HTREEITEM hMod = TreeView_InsertItem(tv, &tvi);
-        // children-регистры по скрину 21 (только CPU заполнен пока)
-        if (kModules[m].regs) {
-            for (int r = 0; r < kModules[m].nRegs; r++)
-                addTreeItem(tv, hMod, kModules[m].regs[r].name, 1);
+static std::string regFullName(const std::string& raw) {
+    std::string s = raw;
+    for (auto& c : s) c = (char)toupper((unsigned char)c);
+    struct KV { const char* n; const char* f; };
+    static const KV dict[] = {
+        {"SREG", "Status Register"}, {"SPH", "Stack Pointer High"}, {"SPL", "Stack Pointer Low"},
+        {"SP", "Stack Pointer"}, {"MCUCR", "MCU Control Register"},
+        {"MCUCSR", "MCU Control and Status Register"}, {"MCUSR", "MCU Status Register"},
+        {"OSCCAL", "Oscillator Calibration Value"}, {"SFIOR", "Special Function IO Register"},
+        {"SMCR", "Sleep Mode Control Register"}, {"CLKPR", "Clock Prescale Register"},
+        {"SPMCSR", "Store Program Memory Control and Status Register"},
+        {"SPMCR", "Store Program Memory Control and Status Register"},
+        {"XDIV", "X-tal Divider Register"},
+        {"GICR", "General Interrupt Control Register"}, {"GIMSK", "General Interrupt Mask Register"},
+        {"GIFR", "General Interrupt Flag Register"},
+        {"PCICR", "Pin Change Interrupt Control Register"}, {"PCIFR", "Pin Change Interrupt Flag Register"},
+        {"PCMSK", "Pin Change Mask Register"}, {"PCMSK0", "Pin Change Mask Register 0"},
+        {"PCMSK1", "Pin Change Mask Register 1"}, {"PCMSK2", "Pin Change Mask Register 2"},
+        {"PCMSK3", "Pin Change Mask Register 3"},
+        {"EICRA", "External Interrupt Control Register A"}, {"EICRB", "External Interrupt Control Register B"},
+        {"EICR", "External Interrupt Control Register"}, {"EIMSK", "External Interrupt Mask Register"},
+        {"EIMF", "External Interrupt Mask Flag"}, {"EIFR", "External Interrupt Flag Register"},
+        {"EIRR", "External Interrupt Request Register"},
+        {"TWBR", "TWI Bit Rate Register"}, {"TWSR", "TWI Status Register"},
+        {"TWAR", "TWI (Slave) Address Register"}, {"TWAMR", "TWI (Slave) Address Mask Register"},
+        {"TWDR", "TWI Data Register"}, {"TWCR", "TWI Control Register"},
+        {"UDR", "USART I/O Data Register"}, {"UDR0", "USART0 I/O Data Register"},
+        {"UDR1", "USART1 I/O Data Register"}, {"UDR2", "USART2 I/O Data Register"},
+        {"UDR3", "USART3 I/O Data Register"},
+        {"UBRR", "USART Baud Rate Register"}, {"UBRR0", "USART0 Baud Rate Register"},
+        {"UBRR1", "USART1 Baud Rate Register"},
+        {"UBRRL", "USART Baud Rate Register Low"}, {"UBRRH", "USART Baud Rate Register High"},
+        {"UCSRA", "USART Control and Status Register A"}, {"UCSRB", "USART Control and Status Register B"},
+        {"UCSRC", "USART Control and Status Register C"}, {"UCR", "USART Control Register"},
+        {"EUDR", "Extended USART Data Register"}, {"EUCSRA", "Extended USART Control and Status A"},
+        {"EUCSRB", "Extended USART Control and Status B"}, {"EUCSRC", "Extended USART Control and Status C"},
+        {"SPCR", "SPI Control Register"}, {"SPSR", "SPI Status Register"}, {"SPDR", "SPI Data Register"},
+        {"EECR", "EEPROM Control Register"}, {"EEDR", "EEPROM Data Register"},
+        {"EEAR", "EEPROM Address Register"}, {"EEARL", "EEPROM Address Register Low"},
+        {"EEARH", "EEPROM Address Register High"},
+        {"WDTCR", "Watchdog Timer Control Register"}, {"WDTCSR", "Watchdog Timer Control and Status Register"},
+        {"ADCL", "ADC Data Register Low"}, {"ADCH", "ADC Data Register High"},
+        {"ADMUX", "ADC Multiplexer Select Register"}, {"ADCSRA", "ADC Control and Status Register A"},
+        {"ADCSRB", "ADC Control and Status Register B"}, {"ADCSRC", "ADC Source Select"},
+        {"ACSR", "Analog Comparator Control and Status Register"},
+        {"ACSRA", "Analog Comparator Control and Status Register A"},
+        {"ACSRB", "Analog Comparator Control and Status Register B"},
+        {"DIDR0", "Digital Input Disable Register 0"}, {"DIDR1", "Digital Input Disable Register 1"},
+        {"TIMSK", "Timer/Counter Interrupt Mask Register"},
+        {"TIFR", "Timer/Counter Interrupt Flag Register"},
+        {"ASSR", "Asynchronous Status Register"},
+        {"PORTA", "Port A Data Register"}, {"PORTB", "Port B Data Register"},
+        {"PORTC", "Port C Data Register"}, {"PORTD", "Port D Data Register"},
+        {"PORTE", "Port E Data Register"}, {"PORTF", "Port F Data Register"},
+        {"PORTG", "Port G Data Register"},
+        {"DDRA", "Port A Data Direction Register"}, {"DDRB", "Port B Data Direction Register"},
+        {"DDRC", "Port C Data Direction Register"}, {"DDRD", "Port D Data Direction Register"},
+        {"DDRE", "Port E Data Direction Register"}, {"DDRF", "Port F Data Direction Register"},
+        {"DDRG", "Port G Data Direction Register"},
+        {"PINA", "Port A Input Pins"}, {"PINB", "Port B Input Pins"},
+        {"PINC", "Port C Input Pins"}, {"PIND", "Port D Input Pins"},
+        {"PINE", "Port E Input Pins"}, {"PINF", "Port F Input Pins"},
+        {"PING", "Port G Input Pins"},
+    };
+    for (auto& kv : dict)
+        if (s == kv.n) return kv.f;
+    // правила для таймеров: TCNT0/TCNT1L/OCR1A/TCCR0B/TIMSK1...
+    auto findDigit = [&](const char* pre) -> int {
+        size_t p = s.find(pre);
+        if (p == std::string::npos) return -1;
+        for (size_t i = p + strlen(pre); i < s.size(); i++)
+            if (isdigit((unsigned char)s[i])) return s[i] - '0';
+        return -1;
+    };
+    static const char* tpre[] = { "TCNT", "TCCR", "OCR", "ICR", "TIMSK", "TIFR" };
+    for (auto pre : tpre) {
+        size_t pp = s.find(pre);
+        if (pp == std::string::npos) continue;
+        int d = findDigit(pre);
+        std::string tail = s.substr(pp + strlen(pre));
+        std::string n = (d >= 0) ? std::to_string(d) : std::string();
+        std::string lbl = (tail == "L") ? " Low" : (tail == "H" ? " High" : (tail.size() > 1 ? " " + tail : ""));
+        if (std::string(pre) == "TCNT")  return "Timer/Counter" + n + lbl;
+        if (std::string(pre) == "TCCR")  return "Timer/Counter" + n + " Control Register" + lbl;
+        if (std::string(pre) == "OCR")   return "Output Compare Register" + n + lbl;
+        if (std::string(pre) == "ICR")   return "Input Capture Register" + n + lbl;
+        if (std::string(pre) == "TIMSK") return "Timer/Counter" + n + " Interrupt Mask Register";
+        if (std::string(pre) == "TIFR")  return "Timer/Counter" + n + " Interrupt Flag Register";
+    }
+    return s + " Register";
+}
+
+// модуль классифицируем по имени регистра (лексика модулей AS4)
+static std::string ioModuleOf(const std::string& raw) {
+    std::string s = raw;
+    for (auto& c : s) c = (char)toupper((unsigned char)c);
+    auto starts = [&](const char* p) { return s.compare(0, strlen(p), p) == 0; };
+    if (starts("PORT") && s.size() >= 5 && isalpha((unsigned char)s[4])) return std::string("PORT") + s[4];
+    if (starts("DDR")  && s.size() == 4 && isalpha((unsigned char)s[3])) return std::string("PORT") + s[3];
+    if (starts("PIN")  && s.size() == 4 && isalpha((unsigned char)s[3])) return std::string("PORT") + s[3];
+    if (starts("VPORT") || starts("GPIO")) return "GPIO";
+    int d = -1;
+    auto dig = [&](const char* pre) -> bool {
+        size_t p = s.find(pre);
+        if (p == std::string::npos) return false;
+        for (size_t i = p + strlen(pre); i < s.size(); i++)
+            if (isdigit((unsigned char)s[i])) { d = s[i] - '0'; return true; }
+        return false;
+    };
+    if (dig("TCNT") || dig("TCCR") || dig("OCR") || dig("ICR") || dig("TIMSK") || dig("TIFR"))
+        return "TIMER_COUNTER_" + std::to_string(d < 0 ? 0 : d);
+    if (s == "ADCL" || s == "ADCH" || s == "ADMUX" || starts("ADC") || starts("ADSC")) return "AD_CONVERTER";
+    if (s == "ACSR" || s == "ACSRA" || s == "ACSRB" || starts("AC0C") || starts("AC1C") ||
+        starts("AC2C") || starts("AC3C") || starts("ACA_") || starts("ACB_")) return "ANALOG_COMPARATOR";
+    if (starts("EE") || starts("DEE")) return "EEPROM";
+    if (s == "EICRA" || s == "EICRB" || s == "EICR" || s == "EIFR" || s == "EIMSK" || s == "EIMF" ||
+        s == "GICR" || s == "GIFR" || s == "GIMSK" || starts("PCICR") || starts("PCIFR") || starts("PCMSK") ||
+        starts("EIRR")) return "EXTERNAL_INTERRUPT";
+    if (starts("TW")) return "TWI";
+    if (starts("UDR") || starts("UBRR") || starts("UCSR") || starts("USART") || s == "UCR" ||
+        starts("EUDR") || starts("EUCS")) return "USART";
+    if (starts("SPCR") || starts("SPSR") || starts("SPDR")) return "SPI";
+    if (starts("WDT")) return "WATCHDOG";
+    if (s == "SREG" || s == "SPL" || s == "SPH" || s == "SP" || s == "MCUCR" || s == "MCUCSR" ||
+        s == "MCUSR" || s == "MCUCS" || s == "MCUR" || s == "SPMCSR" || s == "SPMCR" ||
+        s == "OSCCAL" || s == "SFIOR" || s == "SMCR" || s == "CLKPR" || s == "XDIV" || starts("GPIOR") ||
+        s == "PRR" || s == "PRR0" || s == "PRR1" || starts("RAMP") || s == "EIND") return "CPU";
+    if (starts("USB")) return "USB";
+    if (starts("DMA")) return "DMA";
+    if (starts("CLK")) return "CLOCK";
+    if (starts("NVM")) return "MEMORY";
+    if (starts("EVSYS")) return "EVSYS";
+    if (starts("RTC")) return "RTC";
+    if (starts("PR_PR")) return "POWER";
+    size_t u = s.find('_');
+    if (u != std::string::npos && u > 0) return s.substr(0, u);
+    return "OTHER";
+}
+
+static void ioAddReg(const std::string& name, int sramAddr) {
+    GuiReg r;
+    r.name = name;
+    r.full = regFullName(name);
+    r.ioAddr = sramAddr - 0x20;
+    r.sramAddr = sramAddr;
+    g_ioRegs.push_back(r);
+    std::string mod = ioModuleOf(name);
+    for (auto& m : g_ioMod)
+        if (m.first == mod) { m.second.push_back((int)g_ioRegs.size() - 1); return; }
+    g_ioMod.push_back({ mod, std::vector<int>{ (int)g_ioRegs.size() - 1 } });
+}
+
+// ATmega8 как дефолтный список (мастер создаёт проекты с ATmega8A)
+static const struct { const char* n; int io; } kM8Regs[] = {
+    {"SREG",0x3F},{"SPL",0x3D},{"SPH",0x3E},{"TWBR",0x00},{"TWSR",0x01},{"TWAR",0x02},{"TWDR",0x03},
+    {"ADCL",0x04},{"ADCH",0x05},{"ADCSR",0x06},{"ADCSRA",0x06},{"ADMUX",0x07},{"ACSR",0x08},
+    {"UBRRL",0x09},{"UCSRB",0x0A},{"UCSRA",0x0B},{"UDR",0x0C},{"SPCR",0x0D},{"SPSR",0x0E},{"SPDR",0x0F},
+    {"PIND",0x10},{"DDRD",0x11},{"PORTD",0x12},{"PINC",0x13},{"DDRC",0x14},{"PORTC",0x15},
+    {"PINB",0x16},{"DDRB",0x17},{"PORTB",0x18},{"EECR",0x1C},{"EEDR",0x1D},{"EEARL",0x1E},{"EEARH",0x1F},
+    {"UCSRC",0x20},{"UBRRH",0x20},{"WDTCR",0x21},{"ASSR",0x22},{"OCR2",0x23},{"TCNT2",0x24},
+    {"TCCR2",0x25},{"ICR1L",0x26},{"ICR1H",0x27},{"OCR1BL",0x28},{"OCR1BH",0x29},{"OCR1AL",0x2A},
+    {"OCR1AH",0x2B},{"TCNT1L",0x2C},{"TCNT1H",0x2D},{"TCCR1B",0x2E},{"TCCR1A",0x2F},{"SFIOR",0x30},
+    {"OSCCAL",0x31},{"TCNT0",0x32},{"TCCR0",0x33},{"MCUCSR",0x34},{"MCUSR",0x34},{"MCUCR",0x35},
+    {"TWCR",0x36},{"SPMCR",0x37},{"TIFR",0x38},{"TIMSK",0x39},{"GIFR",0x3A},{"GIMSK",0x3B},{"GICR",0x3B},
+};
+
+// дерево из активного профиля; до старта отладки - базовый ATmega8
+static void fillIoFromProfile() {
+    g_ioRegs.clear();
+    g_ioMod.clear();
+    std::string txt = g_coreInit ? emuapi_regMapText() : std::string();
+    if (g_coreInit && !txt.empty()) {
+        size_t p = 0;
+        while (p < txt.size()) {
+            size_t e = txt.find('\n', p);
+            if (e == std::string::npos) e = txt.size();
+            std::string line = txt.substr(p, e - p);
+            p = e + 1;
+            size_t sp = line.find(' ');
+            if (sp == std::string::npos) continue;
+            std::string nm = line.substr(0, sp);
+            int addr = atoi(line.c_str() + sp + 1);
+            if (nm.empty() || addr < 0 || addr > 0x2000) continue;
+            ioAddReg(nm, addr);
+        }
+    } else {
+        for (auto& r : kM8Regs)
+            ioAddReg(r.n, r.io + 0x20);
+    }
+    std::sort(g_ioMod.begin(), g_ioMod.end(),
+              [](const std::pair<std::string, std::vector<int>>& a,
+                 const std::pair<std::string, std::vector<int>>& b) { return a.first < b.first; });
+    if (g_ioTree) {
+        TreeView_DeleteAllItems(g_ioTree);
+        for (auto& m : g_ioMod) {
+            TVINSERTSTRUCTA tvi = {0};
+            tvi.hInsertAfter = TVI_LAST;
+            tvi.item.mask = TVIF_TEXT | TVIF_IMAGE | TVIF_SELECTEDIMAGE;
+            tvi.item.pszText = (LPSTR)m.first.c_str();
+            tvi.item.iImage = 0; tvi.item.iSelectedImage = 0;
+            HTREEITEM hMod = TreeView_InsertItem(g_ioTree, &tvi);
+            for (int idx : m.second)
+                addTreeItem(g_ioTree, hMod, g_ioRegs[idx].full.c_str(), 1);
         }
     }
-    TreeView_Expand(tv, TreeView_GetRoot(tv), TVE_EXPAND);
+    if (g_ioList) {
+        ListView_DeleteAllItems(g_ioList);
+        for (size_t i = 0; i < g_ioRegs.size(); i++) {
+            GuiReg& r = g_ioRegs[i];
+            static char nm[128], addrIsh[24];
+            snprintf(nm, sizeof(nm), "%s", r.full.c_str());
+            if (r.ioAddr >= 0 && r.ioAddr <= 0x3F) snprintf(addrIsh, sizeof(addrIsh), "0x%02X", r.ioAddr);
+            else snprintf(addrIsh, sizeof(addrIsh), "ext 0x%04X", r.sramAddr);
+            LVITEMA it = {0};
+            it.mask = LVIF_TEXT; it.iItem = (int)i; it.pszText = nm;
+            SendMessageA(g_ioList, LVM_INSERTITEMA, (int)i, (LPARAM)&it);
+            it.iSubItem = 1; it.pszText = addrIsh;
+            SendMessageA(g_ioList, LVM_SETITEMTEXTA, (int)i, (LPARAM)&it);
+        }
+    }
+}
+
+static void fillIoTree(HWND) { fillIoFromProfile(); }   // старый вызов (создание окна)
+
+static void debugStateLine();     // вперёд (определён в секции ядра)
+
+// обновить правый I/O View значениями ядра (Value|Bits для всех строк)
+static void refreshIoListView() {
+    if (!g_coreInit) return;
+    for (size_t i = 0; i < g_ioRegs.size(); i++) {
+        uint8_t v = emuapi_readSram(g_ioRegs[i].sramAddr);
+        static char val[12], bits[16];
+        snprintf(val, sizeof(val), "0x%02X", v);
+        int b = 7; int p = 0;
+        bits[p++] = '0'; bits[p++] = 'b';
+        while (b >= 0) bits[p++] = (v >> b--) & 1 ? '1' : '0';
+        bits[p] = 0;
+        LVITEMA it = {0};
+        it.mask = LVIF_TEXT; it.iItem = (int)i; it.iSubItem = 2; it.pszText = val;
+        SendMessageA(g_ioList, LVM_SETITEMA, 0, (LPARAM)&it);
+        it.iSubItem = 3; it.pszText = bits;
+        SendMessageA(g_ioList, LVM_SETITEMTEXTA, (int)i, (LPARAM)&it);
+    }
+    debugStateLine();
 }
 
 // ------------------------------------------------------------ Message panel
@@ -395,7 +605,7 @@ static void msgAppend(const char* line) {
 }
 
 // ------------------------------------------------------------- Ядро эмулятора
-static bool g_coreInit = false;                    // emuapi_init выполнен
+// g_coreInit объявлен выше (секция I/O View), нулевая инициализация по умолчанию
 static std::atomic<bool> g_runBusy(false);         // работает worker-поток прогона
 static std::string g_projRoot;                     // корень проекта (echo.ctos + исходники)
 static std::string g_appDir;                       // папка exe (для recent.txt, шаблонов, Procs)
@@ -413,20 +623,6 @@ static void debugStateLine() {
              emuapi_pc(), emuapi_sp(), emuapi_sreg(),
              (unsigned long long)emuapi_cycles());
     msgAppend(line);
-}
-
-// обновить правый I/O View значениями ядра (строки листа CPU-модуля)
-static void refreshIoListView() {
-    if (!g_coreInit) return;
-    for (int r = 0; r < 9; r++) {
-        const IoReg& ir = kCpuRegs[r];
-        uint8_t v = emuapi_readSram(0x20 + ir.ioAddr);
-        snprintf(g_valText, sizeof(g_valText), "0x%02X", v);
-        LVITEMA it = {0};
-        it.mask = LVIF_TEXT; it.iItem = r; it.iSubItem = 2; it.pszText = g_valText;
-        SendMessageA(g_ioList, LVM_SETITEMA, 0, (LPARAM)&it);
-    }
-    debugStateLine();
 }
 
 // ------------------------------------------------------------ Processor (скрин 16)
@@ -821,6 +1017,7 @@ static void startDebugging() {
         emuapi_sink(uiAppend);
         emuapi_init(g_projRoot.c_str(), (g_projRoot + "/main.elf").c_str());
         g_coreInit = true;
+        fillIoFromProfile();       // I/O View из [RegisterMap] активного чипа
         msgAppend((std::string("Core: chip=") + emuapi_chip() +
                    "  F_CPU=" + std::to_string(emuapi_fcpu()) + " Hz").c_str());
     }
