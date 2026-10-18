@@ -189,6 +189,9 @@ struct TimerDef {                                     // resolved per profile at
     int tcntL = 0, tcntH = -1;                        // -1 = 8-bit
     int tccr = 0, tifr = 0, timsk = 0;                // SRAM addresses
     int tovBit = 0, toieBit = 0;                      // flag/enable bit positions
+    int ocrAL = -1, ocrAH = -1, ocrBL = -1, ocrBH = -1; // OCR registers (SRAM); A=-1 -> no compare
+    int ocfABit = -1, ocfBBit = -1;                   // OCFxA/B bits in the flag register
+    int oieABit = -1, oieBBit = -1;                   // OCIExA/B bits in the mask register
 };
 static TimerDef  g_ts[3];                   // T0, T1, T2
 static uint64_t  g_tAcc[3] = { 0,0,0 };     // sub-prescaler cycle accumulators
@@ -341,6 +344,50 @@ static void loadEnv() {
         g_ts[2] = { 1, ra("tcnt2"), -1, tccr,
                     (int)(split ? ra("tifr2")  : ra("tifr")),
                     (int)(split ? ra("timsk2") : ra("timsk")), tb, tb };
+    }
+    // Compare match (OCR -> OCF flags): bit layout confirmed against toolchain defines:
+    //  unified (m8/m16/m32/m64/m128/m8535): TIFR and TIMSK have the same bit positions:
+    //    TOV0=0 OCF0=1 TOV1=2 OCF1B=3 OCF1A=4 ICF1=5 TOV2=6 OCF2=7; ATmega8 has no OCF0 (T0 has no compare!)
+    //  split (m48..m328 family, all TIFR*/TIMSK*): TOV*=0, OCFxA=1, OCFxB=2
+    //  tn13: TOV=1, OCF0A=2, OCF0B=3 (verified against iotn13.h)
+    //  ATmega8515 (different arrange): TOV0=1 OCF0=0 TOV1=7 OCF1A=6 OCF1B=5
+    {
+        const std::string lc = lower(g_chip);
+        bool isM8    = lc.compare(0, 7, "atmega8") == 0 && lc.compare(0, 8, "atmega88") != 0;
+        bool isM8515 = lc.compare(0, 9, "atmega8515") == 0;
+        for (int t = 0; t < 3; t++) {
+            if (!g_ts[t].have) continue;
+            if (split) {
+                g_ts[t].ocfABit = 1; g_ts[t].oieABit = 1;
+                g_ts[t].ocfBBit = 2; g_ts[t].oieBBit = 2;
+                const char* aL = t == 0 ? "ocr0a" : t == 1 ? "ocr1al" : "ocr2a";
+                const char* aH = t == 1 ? "ocr1ah" : "";
+                const char* bL = t == 0 ? "ocr0b" : t == 1 ? "ocr1bl" : "ocr2b";
+                const char* bH = t == 1 ? "ocr1bh" : "";
+                g_ts[t].ocrAL = ra(aL); g_ts[t].ocrAH = ra(aH);
+                g_ts[t].ocrBL = ra(bL); g_ts[t].ocrBH = ra(bH);
+                if (g_ts[t].ocrAL < 0) { g_ts[t].ocfABit = -1; g_ts[t].oieABit = -1; }
+                if (g_ts[t].ocrBL < 0) { g_ts[t].ocfBBit = -1; g_ts[t].oieBBit = -1; }
+            } else if (tn13) {
+                g_ts[t].ocrAL = ra("ocr0a");
+                if (g_ts[t].ocrAL >= 0) { g_ts[t].ocfABit = 2; g_ts[t].oieABit = 2; }
+                g_ts[t].ocrBL = ra("ocr0b");
+                if (g_ts[t].ocrBL >= 0) { g_ts[t].ocfBBit = 3; g_ts[t].oieBBit = 3; }
+            } else {
+                static const int cA[3] = { 1, 4, 7 }, cB[3] = { -1, 3, -1 };
+                int ocfA = isM8515 ? (t == 0 ? 0 : t == 1 ? 6 : 7) : cA[t];
+                int ocfB = isM8515 ? (t == 1 ? 5 : -1) : cB[t];
+                const char* aL = t == 0 ? "ocr0" : t == 1 ? "ocr1al" : "ocr2";
+                const char* aH = t == 1 ? "ocr1ah" : "";
+                g_ts[t].ocrAL = ra(aL); g_ts[t].ocrAH = ra(aH);
+                if (g_ts[t].ocrAL >= 0 && ocfA >= 0) { g_ts[t].ocfABit = ocfA; g_ts[t].oieABit = ocfA; }
+                if (t == 1) {
+                    g_ts[t].ocrBL = ra("ocr1bl"); g_ts[t].ocrBH = ra("ocr1bh");
+                    if (g_ts[t].ocrBL >= 0 && ocfB >= 0) { g_ts[t].ocfBBit = ocfB; g_ts[t].oieBBit = ocfB; }
+                }
+            }
+        }
+        if (isM8515) { g_ts[0].tovBit = 1; if (g_ts[1].have) g_ts[1].tovBit = 7; }   // TOV0=1, TOV1=7
     }
 
     resetInts();
@@ -1247,6 +1294,32 @@ static void renderDash() {
             wr(fmt(" [%s] @ 0x%04X = %d (0x%02X)", w.name.c_str(), w.addr, v, v));
         }
     }
+    // [TIMERS]: T0/T1/T2 state — like the Timer panel in the AVR Studio simulator
+    if (g_ts[0].have || g_ts[1].have || g_ts[2].have) {
+        static const int base[8]  = { 0, 1, 8, 64, 256, 1024, 0, 0 };    // T0/T1
+        static const int t2tb[8]  = { 0, 1, 8, 32, 64, 128, 256, 1024 }; // T2
+        for (int t = 0; t < 3; t++) {
+            if (!g_ts[t].have) continue;
+            int cs = readDmem(g_ts[t].tccr) & 7;
+            int n  = (t == 2) ? t2tb[cs] : base[cs];
+            const char* src = n > 0 ? faPres(n) : ((t != 2 && cs >= 6) ? "ext pin" : "stopped");
+            uint16_t tval = (uint16_t)(readDmem(g_ts[t].tcntL) & 0xFF);
+            if (g_ts[t].tcntH >= 0) tval = (uint16_t)(tval | ((readDmem(g_ts[t].tcntH) & 0xFF) << 8));
+            uint8_t tov = (readDmem(g_ts[t].tifr) >> g_ts[t].tovBit) & 1;
+            std::string s = fmt(" [T%d] CS=%d (%s)  TCNT=0x%04X  TOV=%d", t, cs, src, tval, tov);
+            if (g_ts[t].ocrAL >= 0 && g_ts[t].ocfABit >= 0) {
+                uint16_t ma = (uint16_t)(readDmem(g_ts[t].ocrAL) & 0xFF);
+                if (g_ts[t].ocrAH >= 0) ma = (uint16_t)(ma | ((readDmem(g_ts[t].ocrAH) & 0xFF) << 8));
+                s += fmt("  CA:OCR=0x%04X F=%d", ma, (readDmem(g_ts[t].tifr) >> g_ts[t].ocfABit) & 1);
+            }
+            if (g_ts[t].ocrBL >= 0 && g_ts[t].ocfBBit >= 0) {
+                uint16_t mb = (uint16_t)(readDmem(g_ts[t].ocrBL) & 0xFF);
+                if (g_ts[t].ocrBH >= 0) mb = (uint16_t)(mb | ((readDmem(g_ts[t].ocrBH) & 0xFF) << 8));
+                s += fmt("  CB:OCR=0x%04X F=%d", mb, (readDmem(g_ts[t].tifr) >> g_ts[t].ocfBBit) & 1);
+            }
+            wr(s, n > 0 ? GREEN : DGRAY);
+        }
+    }
     // stopwatch
     wr("================================================================================", DCYAN);
 }
@@ -1399,17 +1472,24 @@ static void tickTimers(int cy) {
         g_tAcc[t] += (uint64_t)cy;
         while (g_tAcc[t] >= (uint64_t)n) {
             g_tAcc[t] -= (uint64_t)n;
-            uint8_t wasL = (uint8_t)readDmem(g_ts[t].tcntL);
-            uint8_t isL  = (uint8_t)(wasL + 1);
-            writeDmem(g_ts[t].tcntL, isL);
-            bool ovf = (isL == 0);                                     // 8-bit wrap
-            if (g_ts[t].tcntH >= 0) {                                  // 16-bit: tick high byte on carry
-                uint8_t wasH = (uint8_t)readDmem(g_ts[t].tcntH);
-                uint8_t isH  = (uint8_t)(wasH + 1);
-                if (isL == 0) { writeDmem(g_ts[t].tcntH, isH); ovf = (isH == 0); }
-                else ovf = false;
+            // full counter value (8/16-bit), +1 per tick
+            uint16_t tval = (uint16_t)(readDmem(g_ts[t].tcntL) & 0xFF);
+            if (g_ts[t].tcntH >= 0) tval = (uint16_t)(tval | ((readDmem(g_ts[t].tcntH) & 0xFF) << 8));
+            // compare match: new TCNT == OCR -> set OCFx flag (like the compare unit)
+            if (g_ts[t].ocrAL >= 0 && g_ts[t].ocfABit >= 0) {
+                uint16_t ma = (uint16_t)(readDmem(g_ts[t].ocrAL) & 0xFF);
+                if (g_ts[t].ocrAH >= 0) ma = (uint16_t)(ma | ((readDmem(g_ts[t].ocrAH) & 0xFF) << 8));
+                if (((uint16_t)(tval + 1)) == ma) writeDmem(g_ts[t].tifr, readDmem(g_ts[t].tifr) | (1 << g_ts[t].ocfABit));
             }
-            if (ovf) writeDmem(g_ts[t].tifr, readDmem(g_ts[t].tifr) | (1 << g_ts[t].tovBit));
+            if (g_ts[t].ocrBL >= 0 && g_ts[t].ocfBBit >= 0) {
+                uint16_t mb = (uint16_t)(readDmem(g_ts[t].ocrBL) & 0xFF);
+                if (g_ts[t].ocrBH >= 0) mb = (uint16_t)(mb | ((readDmem(g_ts[t].ocrBH) & 0xFF) << 8));
+                if (((uint16_t)(tval + 1)) == mb) writeDmem(g_ts[t].tifr, readDmem(g_ts[t].tifr) | (1 << g_ts[t].ocfBBit));
+            }
+            uint16_t nv = (uint16_t)(tval + 1);
+            writeDmem(g_ts[t].tcntL, nv & 0xFF);
+            if (g_ts[t].tcntH >= 0) writeDmem(g_ts[t].tcntH, (nv >> 8) & 0xFF);
+            if (nv == 0) writeDmem(g_ts[t].tifr, readDmem(g_ts[t].tifr) | (1 << g_ts[t].tovBit)); // overflow
         }
     }
 }
@@ -1499,6 +1579,31 @@ static bool dispatchPending() {
             uint8_t f = readDmem(g_ts[t].tifr), en = readDmem(g_ts[t].timsk);
             if (((f >> g_ts[t].tovBit) & 1) && ((en >> g_ts[t].toieBit) & 1))
                 list.push_back({ vi->second, names[k], true, g_ts[t].tifr, g_ts[t].tovBit });
+            break;
+        }
+        // compare match: OCFxA/B + OCIExA/B
+        const char* cnA[3] = { t == 0 ? "timer0_compa_vect" : t == 1 ? "timer1_compa_vect" : "timer2_compa_vect",
+                               t == 0 ? "tim0_compa_vect"   : t == 1 ? "tim1_compa_vect"   : "tim2_compa_vect",
+                               t == 0 ? "timer0_comp_vect"  : t == 1 ? "" : "timer2_comp_vect" };
+        const char* cnB[3] = { t == 0 ? "timer0_compb_vect" : t == 1 ? "timer1_compb_vect" : "timer2_compb_vect",
+                               t == 0 ? "tim0_compb_vect"   : t == 1 ? "tim1_compb_vect"   : "tim2_compb_vect",
+                               t == 0 ? "timer0_comp_vect"  : t == 1 ? "" : "timer2_comp_vect" };
+        for (int k = 0; k < 3 && g_ts[t].ocfABit >= 0 && g_ts[t].oieABit >= 0; k++) {
+            if (cnA[k][0] == '\0') break;
+            auto vi = g_isrv.find(cnA[k]);
+            if (vi == g_isrv.end()) continue;
+            uint8_t f = readDmem(g_ts[t].tifr), en = readDmem(g_ts[t].timsk);
+            if (((f >> g_ts[t].ocfABit) & 1) && ((en >> g_ts[t].oieABit) & 1))
+                list.push_back({ vi->second, cnA[k], true, g_ts[t].tifr, g_ts[t].ocfABit });
+            break;
+        }
+        for (int k = 0; k < 3 && g_ts[t].ocfBBit >= 0 && g_ts[t].oieBBit >= 0; k++) {
+            if (cnB[k][0] == '\0') break;
+            auto vi = g_isrv.find(cnB[k]);
+            if (vi == g_isrv.end()) continue;
+            uint8_t f = readDmem(g_ts[t].tifr), en = readDmem(g_ts[t].timsk);
+            if (((f >> g_ts[t].ocfBBit) & 1) && ((en >> g_ts[t].oieBBit) & 1))
+                list.push_back({ vi->second, cnB[k], true, g_ts[t].tifr, g_ts[t].ocfBBit });
             break;
         }
     }
@@ -2222,13 +2327,29 @@ static bool dispatch(const std::string& line) {
             if (!g_ts[t].have) continue;
             int cs = readDmem(g_ts[t].tccr) & 7;
             int n = (t == 2) ? t2tb[cs] : base[cs];
-            const char* src = n > 1 ? faPres(n) : ((t != 2 && cs >= 6) ? "ext pin (не тикает)" : "stopped");
+            const char* src = n > 0 ? faPres(n) : ((t != 2 && cs >= 6) ? "ext pin (не тикает)" : "stopped");
             uint16_t tval = (uint16_t)(readDmem(g_ts[t].tcntL) & 0xFF);
             if (g_ts[t].tcntH >= 0) tval = (uint16_t)(tval | ((readDmem(g_ts[t].tcntH) & 0xFF) << 8));
-            wr(fmt("  T%d TCCR CS=%d (%s) TCNT=0x%04X en=%d flag=%d",
+            std::string cmp;
+            if (g_ts[t].ocrAL >= 0 && g_ts[t].ocfABit >= 0) {
+                uint16_t ma = (uint16_t)(readDmem(g_ts[t].ocrAL) & 0xFF);
+                if (g_ts[t].ocrAH >= 0) ma = (uint16_t)(ma | ((readDmem(g_ts[t].ocrAH) & 0xFF) << 8));
+                cmp += fmt(" CA:OCR=0x%04X OCA=%d/%d", ma,
+                           (readDmem(g_ts[t].timsk) >> g_ts[t].oieABit) & 1,
+                           (readDmem(g_ts[t].tifr)  >> g_ts[t].ocfABit) & 1);
+            }
+            if (g_ts[t].ocrBL >= 0 && g_ts[t].ocfBBit >= 0) {
+                uint16_t mb = (uint16_t)(readDmem(g_ts[t].ocrBL) & 0xFF);
+                if (g_ts[t].ocrBH >= 0) mb = (uint16_t)(mb | ((readDmem(g_ts[t].ocrBH) & 0xFF) << 8));
+                cmp += fmt(" CB:OCR=0x%04X OCB=%d/%d", mb,
+                           (readDmem(g_ts[t].timsk) >> g_ts[t].oieBBit) & 1,
+                           (readDmem(g_ts[t].tifr)  >> g_ts[t].ocfBBit) & 1);
+            }
+            wr(fmt("  T%d TCCR CS=%d (%s) TCNT=0x%04X en=%d flag=%d   %s",
                    t, cs, src, tval,
                    (readDmem(g_ts[t].timsk) >> g_ts[t].toieBit) & 1,
-                   (readDmem(g_ts[t].tifr)  >> g_ts[t].tovBit) & 1), CYAN);
+                   (readDmem(g_ts[t].tifr)  >> g_ts[t].tovBit) & 1,
+                   cmp.c_str()), CYAN);
         }
         // vector table (index order)
         std::vector<std::pair<int, std::string>> vt;
