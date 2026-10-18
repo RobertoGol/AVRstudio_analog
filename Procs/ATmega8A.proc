@@ -25,6 +25,8 @@ C = 0x13 0x14 0x15
 D = 0x10 0x11 0x12
 
 [Interrupts]
+Int0Pin = D2
+Int1Pin = D3
 # vector_index = name ; FLASH address = index*2 (each vector = 1 word RJMP slot)
 1 = INT0_vect
 2 = INT1_vect

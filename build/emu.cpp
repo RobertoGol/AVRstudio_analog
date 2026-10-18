@@ -139,6 +139,13 @@ static uint64_t parseAddr(const std::string& sv) {
     if (v.empty()) return 0;
     return strtoull(v.c_str(), nullptr, 0);   // handles 0xNN and decimal
 }
+static const char* faPres(int n) {      // timer prescaler label
+    switch (n) {
+        case 1: return "1x"; case 8: return "8x"; case 32: return "32x"; case 64: return "64x";
+        case 128: return "128x"; case 256: return "256x"; case 1024: return "1024x";
+        default: return "?";
+    }
+}
 
 // SPM state (used by loadEnv below; implementation near execOne)
 static uint16_t g_spmPageSize = 64;                 // SPM_PAGESIZE (bytes), from the profile
@@ -152,6 +159,29 @@ static void spmInit() {
     }
     g_pagebuf.assign(g_spmPageSize, 0xFF);
 }
+
+// ---------------------------------------------------------------------
+// Interrupt dispatcher state (README sec.5.2)
+// Vectors come from the profile [Interrupts]; registers from [RegisterMap].
+// ---------------------------------------------------------------------
+static std::map<std::string,int> g_isrv;    // lowercase vector name -> vector index (PC word == index)
+static std::map<std::string,int> g_regmap;  // lowercase register name -> SRAM address (IO+0x20 / MEM direct)
+struct TimerDef {                                     // resolved per profile at load
+    int have = 0;
+    int tcntL = 0, tcntH = -1;                        // -1 = 8-bit
+    int tccr = 0, tifr = 0, timsk = 0;                // SRAM addresses
+    int tovBit = 0, toieBit = 0;                      // flag/enable bit positions
+};
+static TimerDef  g_ts[3];                   // T0, T1, T2
+static uint64_t  g_tAcc[3] = { 0,0,0 };     // sub-prescaler cycle accumulators
+static int       g_int0PinIO = 0x10, g_int0Bit = 2;   // INT0 pin (default PD2)
+static int       g_int1PinIO = 0x10, g_int1Bit = 3;   // INT1 pin (default PD3)
+static bool      g_edgeInit = false;        // no spurious edge on first tick after load/rst
+static void resetInts() {
+    g_tAcc[0] = g_tAcc[1] = g_tAcc[2] = 0;
+    g_edgeInit = false;
+}
+static uint8_t g_edgeSt[2] = { 0, 0 };      // previous logical level of INT0/INT1 pins (edge detector)
 
 static void loadEnv() {
     auto cfg = readPairs(g_root + "/echo.ctos");
@@ -197,6 +227,93 @@ static void loadEnv() {
         }
     }
     if (!np.empty()) { g_pio = np; g_pname = nn; g_ext.clear(); g_ext.resize(np.size()); }
+
+    // [RegisterMap] lines "NAME|TYPE|ADDR": NAME(lower) -> SRAM address.
+    // IO8 addresses get +0x20 (IO space -> SRAM view); MEM8 stay as-is.
+    g_regmap.clear();
+    {
+        std::ifstream f(prof);
+        std::string ln; bool inRM = false;
+        while (std::getline(f, ln)) {
+            size_t s = ln.find_first_not_of(" \t\r\n");
+            if (s == std::string::npos) continue;
+            ln = ln.substr(s);
+            if (ln[0] == '[') {
+                size_t e = ln.find(']');
+                std::string sec = (e != std::string::npos) ? ln.substr(1, e-1) : ln.substr(1);
+                inRM = (lower(sec) == "registermap");
+                continue;
+            }
+            if (!inRM || ln[0] == '#') continue;
+            size_t p1 = ln.find('|'); if (p1 == std::string::npos) continue;
+            size_t p2 = ln.find('|', p1+1); if (p2 == std::string::npos) continue;
+            std::string nm  = lower(ln.substr(0, p1));
+            std::string tp  = lower(ln.substr(p1+1, p2-p1-1));
+            int addr = (int)parseAddr(ln.substr(p2+1));
+            if (nm.empty() || addr < 0 || addr > 0x2000) continue;
+            if (tp.find("io") == 0) addr += 0x20;    // IO address
+            g_regmap[nm] = addr;
+        }
+    }
+
+    // [Interrupts] rows "INDEX = NAME_vectors" -> vector table (PC word == index)
+    g_isrv.clear();
+    for (auto& kv : p) {
+        std::string v = lower(kv.second); size_t h = v.find('#');
+        if (h != std::string::npos) v = v.substr(0, h); v.erase(v.find_last_not_of(" \t")+1);
+        if (v.size() <= 5 || v.substr(v.size()-5) != "_vect") continue;
+        unsigned idx = 0;
+        if (sscanf(kv.first.c_str(), "%u", &idx) != 1 || idx == 0) continue;
+        g_isrv[v] = (int)idx;
+    }
+
+    // External interrupt pins: profile keys "Int0Pin = D2" (port letter + bit)
+    {
+        auto rp = [&](const char* key, int& pinIO, int& bit, int defPin, int defBit) {
+            pinIO = defPin; bit = defBit;
+            auto i = p.find(key); if (i == p.end()) return;
+            std::string s = i->second; size_t h = s.find('#');
+            if (h != std::string::npos) s = s.substr(0, h);
+            s.erase(0, s.find_first_not_of(" \t")); s.erase(s.find_last_not_of(" \t\r")+1);
+            if (s.size() < 2 || !isdigit((unsigned char)s[1]) || s[1] > '7') return;
+            int pi = portIndex(toupper((unsigned char)s[0]));
+            if (pi < 0) return;
+            pinIO = g_pio[pi].pin;
+            bit = s[1] - '0';
+        };
+        rp("int0pin", g_int0PinIO, g_int0Bit, 0x10, 2);
+        rp("int1pin", g_int1PinIO, g_int1Bit, 0x10, 3);
+    }
+
+    // Timer definitions (per chip family; verified against toolchain headers):
+    //  unified (m8/m16/m32): TIFR/TIMSK, TOV0=bit0, TOV1=bit2, TOV2=bit6
+    //  split (m88/m168/m328): TIFR0/1/2 + TIMSK0/1/2, all bits=0 (TOV2=1 on tn13)
+    //  tn13: single TIFR0/TIMSK0, old datasheet bit1
+    auto ra = [&](const char* n) -> int { auto i = g_regmap.find(n); return i != g_regmap.end() ? i->second : -1; };
+    for (int t = 0; t < 3; t++) g_ts[t] = TimerDef();
+    bool split = ra("tifr0") >= 0 && ra("tifr1") >= 0 && ra("tifr") < 0;
+    bool tn13  = ra("tifr0") >= 0 && ra("tifr1") <  0 && ra("tifr") < 0;
+    if (ra("tcnt0") >= 0) {
+        int tccr = (ra("tccr0b") >= 0) ? ra("tccr0b") : ra("tccr0");
+        if (split || tn13) { int tb = tn13 ? 1 : 0;
+            g_ts[0] = { 1, ra("tcnt0"), -1, tccr, ra("tifr0"), ra("timsk0"), tb, tb };
+        } else g_ts[0] = { 1, ra("tcnt0"), -1, tccr, ra("tifr"), ra("timsk"), 0, 0 };
+    }
+    if (ra("tcnt1l") >= 0 && ra("tcnt1h") >= 0) {
+        int tb = split ? 0 : 2;
+        g_ts[1] = { 1, ra("tcnt1l"), ra("tcnt1h"), (int)ra("tccr1b"),
+                    (int)(split ? ra("tifr1")  : ra("tifr")),
+                    (int)(split ? ra("timsk1") : ra("timsk")), tb, tb };
+    }
+    if (ra("tcnt2") >= 0) {
+        int tccr = (ra("tccr2b") >= 0) ? ra("tccr2b") : ra("tccr2");
+        int tb = split ? 0 : 6;
+        g_ts[2] = { 1, ra("tcnt2"), -1, tccr,
+                    (int)(split ? ra("tifr2")  : ra("tifr")),
+                    (int)(split ? ra("timsk2") : ra("timsk")), tb, tb };
+    }
+
+    resetInts();
 }
 
 // ---------------------------------------------------------------------
@@ -704,12 +821,12 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
         g_dmem[rd] = res & 0xFF; g_dmem[rd+1] = (res>>8)&0xFF; cy = 2;
     }
     else if ((op & 0xF800) == 0xB000) {                            // IN
-        int A = (op & 0xF) | (((op>>8)&3)<<4);
+        int A = (op & 0xF) | (((op>>9)&3)<<4);   // A[5:4]=bits[10:9], bit8 is Rd[4]
         rd = (op>>4)&0x1F;
         g_dmem[rd] = readDmem(0x20 + A);
     }
     else if ((op & 0xF800) == 0xB800) {                            // OUT
-        int A = (op & 0xF) | (((op>>8)&3)<<4);
+        int A = (op & 0xF) | (((op>>9)&3)<<4);
         rr = (op>>4)&0x1F;
         writeDmem(0x20 + A, g_dmem[rr]);
     }
@@ -854,11 +971,8 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
         g_dmem[rd] = (uint8_t)r; setShiftFlags(r, cout);
     }
     else if (op == 0x95E8) { doSpm(); cy = 2; }                  // SPM (before BSET mask: 0x95E8&0xFF0F==0x9408!)
-    else if ((op & 0xFF0F) == 0x9408) {                          // BSET s (SEC/SEZ/SEN/...)
-        setChipFlag((op>>4)&7, 1);
-    }
-    else if ((op & 0xFF0F) == 0x9488) {                          // BCLR s (CLC/CLU/CLN/...)
-        setChipFlag((op>>4)&7, 0);
+    else if ((op & 0xFF0F) == 0x9408) {                          // BSET/BCLR s: s=[6:4], bit7: 0=set/1=clear
+        setChipFlag((op>>4)&7, (op>>7)&1 ? 0 : 1);
     }
     else if (op == 0x9588) { cy = 1; }                           // SLEEP (ignored)
     else if (op == 0x95A8) { cy = 1; }                           // WDR (ignored)
@@ -928,7 +1042,7 @@ static std::string decodeOp(uint16_t op) {
     }
     if ((op & 0xFF0F) == 0x9408 || (op & 0xFF0F) == 0x9488) {
         static const char* fn[8] = {"C","Z","N","V","S","H","T","I"};
-        snprintf(b, sizeof b, "%s%s (flag %s)", (op&0xFF0F)==0x9408?"SE":"CL", fn[(op>>4)&7], fn[(op>>4)&7]); return b;
+        snprintf(b, sizeof b, "%s%s (flag %s)", (op>>7)&1 ? "CL" : "SE", fn[(op>>4)&7], fn[(op>>4)&7]); return b;
     }
     if (op == 0x95E8) return "SPM";
     if (op == 0x9588) return "SLEEP";
@@ -962,8 +1076,8 @@ static std::string decodeOp(uint16_t op) {
         case 0xE000: snprintf(b, sizeof b, "LDI  R%u, 0x%02X", d+16, (op&0xF)|((op>>4)&0xF0)); return b;
         case 0xC000: snprintf(b, sizeof b, "RJMP 0x%04X", g_pc + 1 + (op&0xFFF)); return b;
         case 0xD000: snprintf(b, sizeof b, "RCALL 0x%04X", g_pc + 1 + (op&0xFFF)); return b;
-        case 0xB000: if (op & 0x0800) snprintf(b, sizeof b, "OUT  0x%02X, R%u", (op&0xF)|((op>>8)&3)<<4, (op>>4)&0x1F);
-                     else            snprintf(b, sizeof b, "IN   R%u, 0x%02X", (op>>4)&0x1F, (op&0xF)|((op>>8)&3)<<4); return b;
+        case 0xB000: if (op & 0x0800) snprintf(b, sizeof b, "OUT  0x%02X, R%u", (op&0xF)|((op>>9)&3)<<4, (op>>4)&0x1F);
+                     else            snprintf(b, sizeof b, "IN   R%u, 0x%02X", (op>>4)&0x1F, (op&0xF)|((op>>9)&3)<<4); return b;
         case 0xF000: {                                            // BRBS/BRBC + aliases
             static const char* nB[8] = {"BRCS","BREQ","BRMI","BRVS","BRGE","BRHS","BRTS","BRIE"};
             static const char* nC[8] = {"BRCC","BRNE","BRPL","BRVC","BRLT","BRHC","BRTC","BRID"};
@@ -1205,6 +1319,139 @@ static int parseNum(const std::string& s, bool& ok) {
 }
 
 // ---------------------------------------------------------------------
+// Interrupt dispatch (README sec.5.2): runs once per executed instruction.
+//  - Timer overflows: real TCNT0/1/2 counters tick per prescaler cycles
+//    (TCCRn CS bits), overflow sets TOVn in TIFR(n).
+//  - External INT0/INT1: edge detector on the INT pin (MCUCR/EICRA ISC bits),
+//    event sets INTFn in GIFR/EIFR.
+//  - Pending sources (enable && flag, or low-level for INT) call the ISR:
+//    push return PC, I=0, PC=vector, +4 cycles (hardware entry cost).
+// Vectors/addresses are taken from the chip profile, sorted by priority
+// (ascending vector index). RETI restores I=1 (execOne).
+// ---------------------------------------------------------------------
+static void tickTimers(int cy) {
+    if (cy <= 0) return;
+    for (int t = 0; t < 3; t++) {
+        if (!g_ts[t].have) continue;
+        int cs = readDmem(g_ts[t].tccr) & 7;
+        static const int base[8] = { 0, 1, 8, 64, 256, 1024, 0, 0 };   // T0/T1 (CS 6..7 = ext pin: not emulated)
+        static const int t2tb[8] = { 0, 1, 8, 32, 64, 128, 256, 1024 }; // T2
+        int n = (t == 2) ? t2tb[cs] : base[cs];
+        if (n <= 0) { g_tAcc[t] = 0; continue; }                       // stopped
+        g_tAcc[t] += (uint64_t)cy;
+        while (g_tAcc[t] >= (uint64_t)n) {
+            g_tAcc[t] -= (uint64_t)n;
+            uint8_t wasL = (uint8_t)readDmem(g_ts[t].tcntL);
+            uint8_t isL  = (uint8_t)(wasL + 1);
+            writeDmem(g_ts[t].tcntL, isL);
+            bool ovf = (isL == 0);                                     // 8-bit wrap
+            if (g_ts[t].tcntH >= 0) {                                  // 16-bit: tick high byte on carry
+                uint8_t wasH = (uint8_t)readDmem(g_ts[t].tcntH);
+                uint8_t isH  = (uint8_t)(wasH + 1);
+                if (isL == 0) { writeDmem(g_ts[t].tcntH, isH); ovf = (isH == 0); }
+                else ovf = false;
+            }
+            if (ovf) writeDmem(g_ts[t].tifr, readDmem(g_ts[t].tifr) | (1 << g_ts[t].tovBit));
+        }
+    }
+}
+
+static void tickExtEdge() {
+    if (g_isrv.empty()) return;
+    // ISC register / flag reg / enable reg per chip family (from regmap names)
+    bool hasEimsk = g_regmap.count("eimsk") > 0;               // modern m88/168/328 family
+    bool hasTf0   = g_regmap.count("tifr0") > 0 && g_regmap.count("tifr1") == 0;   // tn13 (single INT0)
+    int iscIO  = (hasEimsk && g_regmap.count("eicra")) ? g_regmap["eicra"] : 0x55;   // MCUCR = IO 0x35
+    int flagIO = hasEimsk ? ((g_regmap.count("eifr"))  ? g_regmap["eifr"] : 0x3C)    // EIFR fallback (IO 0x1C)
+                          : 0x5A;                       // GIFR = IO 0x3A (m8/16/32, tn13 alike)
+    struct X { int pinIO, bit, flagBit, enBit; const char* vec; };
+    X e[2] = { { g_int0PinIO, g_int0Bit, 0, 0, "int0_vect" },
+               { g_int1PinIO, g_int1Bit, 0, 0, "int1_vect" } };
+    if (hasEimsk) { e[0].flagBit = 0; e[0].enBit = 0; e[1].flagBit = 1; e[1].enBit = 1; }   // EIFR/EIMSK
+    else          { e[0].flagBit = 6; e[0].enBit = 6; e[1].flagBit = 7; e[1].enBit = 7; }   // GIFR/GICR
+    uint8_t isc = readDmem(iscIO);
+    for (int i = 0; i < 2; i++) {
+        if (!g_isrv.count(e[i].vec)) continue;
+        if (i == 1 && hasTf0) continue;                        // tiny13 has no INT1
+        uint8_t cur = (uint8_t)((readDmem(0x20 + e[i].pinIO) >> e[i].bit) & 1);
+        int m = (i == 0) ? 0 : 2;
+        if (g_edgeInit) {
+            uint8_t prev = g_edgeSt[i];
+            int mode = (isc >> m) & 3;
+            bool hit = (mode == 1) ? (prev != cur)                                    // any logical change
+                     : (mode == 2) ? (prev == 1 && cur == 0)                          // falling edge
+                     : (mode == 3) ? (prev == 0 && cur == 1)                          // rising edge
+                     : false;                                                          // low level -> dispatch only
+            if (hit) writeDmem(flagIO, readDmem(flagIO) | (1 << e[i].flagBit));
+        }
+        g_edgeSt[i] = cur;
+    }
+    g_edgeInit = true;
+}
+
+static void tickInts(int cy) { tickTimers(cy); tickExtEdge(); }
+
+// Returns true when an ISR was entered (PC now points at the vector).
+static bool dispatchPending() {
+    if (!g_f.I || g_isrv.empty()) return false;
+    bool hasEimsk = g_regmap.count("eimsk") > 0;
+    bool hasTf0   = g_regmap.count("tifr0") > 0 && g_regmap.count("tifr1") == 0;
+    struct Src { int vec; std::string name; bool active; int flagIO, flagBit; };
+    std::vector<Src> list;
+    int iscIO  = (hasEimsk && g_regmap.count("eicra")) ? g_regmap["eicra"] : 0x55;
+    int flagIO = hasEimsk ? ((g_regmap.count("eifr"))  ? g_regmap["eifr"] : 0x3C) : 0x5A;
+    int enIO   = hasEimsk ? ((g_regmap.count("eimsk")) ? g_regmap["eimsk"] : 0x3D)
+                          : (hasTf0 ? ((g_regmap.count("gimsk")) ? g_regmap["gimsk"] : 0x5B)
+                                    : ((g_regmap.count("gicr"))    ? g_regmap["gicr"] : 0x5B));
+    struct X { int pinIO, bit, flagBit, enBit; const char* vec; };
+    X e[2] = { { g_int0PinIO, g_int0Bit, 0, 0, "int0_vect" },
+               { g_int1PinIO, g_int1Bit, 0, 0, "int1_vect" } };
+    if (hasEimsk) { e[0].flagBit = 0; e[0].enBit = 0; e[1].flagBit = 1; e[1].enBit = 1; }
+    else          { e[0].flagBit = 6; e[0].enBit = 6; e[1].flagBit = 7; e[1].enBit = 7; }
+    uint8_t isc = readDmem(iscIO);
+    for (int i = 0; i < 2; i++) {
+        auto vi = g_isrv.find(e[i].vec);
+        if (vi == g_isrv.end()) continue;
+        if (i == 1 && hasTf0) continue;
+        int m = (i == 0) ? 0 : 2;
+        int mode = (isc >> m) & 3;
+        bool active;
+        if (mode == 0) active = (readDmem(0x20 + e[i].pinIO) >> e[i].bit & 1) == 0;   // low level while held
+        else           active = (readDmem(flagIO) >> e[i].flagBit) & 1;
+        if (!active) continue;
+        uint8_t en = readDmem(enIO);
+        if (!((en >> e[i].enBit) & 1)) continue;
+        list.push_back({ vi->second, e[i].vec, true, flagIO, e[i].flagBit });
+    }
+    for (int t = 0; t < 3; t++) {
+        if (!g_ts[t].have) continue;
+        const char* names[2] = { t == 0 ? "timer0_ovf_vect" : t == 1 ? "timer1_ovf_vect" : "timer2_ovf_vect",
+                                 t == 0 ? "tim0_ovf_vect"   : t == 1 ? "tim1_ovf_vect"   : "tim2_ovf_vect" };
+        for (int k = 0; k < 2 && k < (t == 1 ? 1 : 2); k++) {
+            auto vi = g_isrv.find(names[k]);
+            if (vi == g_isrv.end()) continue;
+            uint8_t f = readDmem(g_ts[t].tifr), en = readDmem(g_ts[t].timsk);
+            if (((f >> g_ts[t].tovBit) & 1) && ((en >> g_ts[t].toieBit) & 1))
+                list.push_back({ vi->second, names[k], true, g_ts[t].tifr, g_ts[t].tovBit });
+            break;
+        }
+    }
+    if (list.empty()) return false;
+    // hardware priority: lowest vector number first
+    size_t best = 0;
+    for (size_t i = 1; i < list.size(); i++) if (list[i].vec < list[best].vec) best = i;
+    Src& s = list[best];
+    pushWord(g_pc);                 // return address (next instruction)
+    g_f.I = 0;                      // ISR runs with interrupts off
+    g_pc = (uint16_t)s.vec;         // vector slot (PC word == vector index)
+    g_cycles += 4;                  // interrupt entry costs 4 cycles
+    // acknowledge: clear the pending flag (edge/overflow sources; low-level re-arms while held)
+    writeDmem(s.flagIO, readDmem(s.flagIO) & ~(1 << s.flagBit));
+    if (!g_quiet) wr(fmt("-- Interrupt: %s -> PC=0x%04X (cycle %llu)", s.name.c_str(), g_pc, (unsigned long long)g_cycles), MAGENTA);
+    return true;
+}
+
+// ---------------------------------------------------------------------
 // Shared runner: executes until a user bp / temp bp / maxCycles.
 // Returns: 0=hit user bp, 1=hit temp bp, -1=stopped (max/EOF)
 // ---------------------------------------------------------------------
@@ -1224,6 +1471,8 @@ static int runUntil(uint64_t maxC, const char* tag) {
         uint16_t op; int cy;
         if (!execOne(op, cy)) break;
         cnt++;
+        tickInts(cy);
+        if (dispatchPending()) cnt++;
     }
     g_running = false;
     return -1;
@@ -1244,6 +1493,7 @@ static bool dispatch(const std::string& line) {
                 g_pc = 0; g_cycles = 0;
                 std::fill(g_dmem.begin(), g_dmem.end(), 0);
                 g_dmem[0x5D] = RAM_END & 0xFF; g_dmem[0x5E] = (RAM_END>>8)&0xFF;
+                resetInts();
                 snapPrev(); renderDash(); wr("Reset done.", GREEN); return true;
             }
             if (loadElfSys(g_elf, err)) { snapPrev(); wr("Loaded: " + g_elf, GREEN); renderDash(); }
@@ -1253,7 +1503,7 @@ static bool dispatch(const std::string& line) {
     }
     if (cmd == "load" || cmd == "emu.start") {
         std::string err;
-        if (loadElfSys(g_elf, err)) { snapPrev(); wr("Loaded: " + g_elf, GREEN); renderDash(); }
+        if (loadElfSys(g_elf, err)) { resetInts(); snapPrev(); wr("Loaded: " + g_elf, GREEN); renderDash(); }
         else wr("Load failed: " + err, RED);
         return true;
     }
@@ -1262,6 +1512,7 @@ static bool dispatch(const std::string& line) {
         std::fill(g_dmem.begin(), g_dmem.end(), 0);
         for (int i = 0; i < (int)g_pio.size(); i++) { g_ext[i].mask = 0; g_ext[i].level = 0; }
         g_dmem[0x5D] = RAM_END & 0xFF; g_dmem[0x5E] = (RAM_END>>8)&0xFF;
+        resetInts();
         snapPrev(); renderDash(); wr("Reset done.", GREEN); return true;
     }
     if (cmd == "stepi" || cmd == "si") {
@@ -1272,6 +1523,8 @@ static bool dispatch(const std::string& line) {
         for (int i = 0; i < n; i++) {
             uint16_t op; int cy;
             if (!execOne(op, cy)) break;
+            tickInts(cy);
+            dispatchPending();
             renderDash();
         }
         return true;
@@ -1319,6 +1572,8 @@ static bool dispatch(const std::string& line) {
                 } else {
                     uint16_t op; int cy;
                     if (!execOne(op, cy)) break;
+                    tickInts(cy);
+                    dispatchPending();
                 }
             }
             renderDash();
@@ -1340,6 +1595,8 @@ static bool dispatch(const std::string& line) {
             uint16_t op; int cy;
             if (!execOne(op, cy)) break;
             cnt++;
+            tickInts(cy);
+            if (dispatchPending()) cnt++;
             uint16_t spNow = g_dmem[0x5D] | (g_dmem[0x5E]<<8);
             hitRet = (op == 0x9508 || op == 0x9518);
             if (spNow < spEntry) { below = true; }
@@ -1409,6 +1666,8 @@ static bool dispatch(const std::string& line) {
             uint16_t op; int cy;
             if (!execOne(op, cy)) break;
             cnt++;
+            tickInts(cy);
+            if (dispatchPending()) cnt++;
         }
         g_running = false;
         renderDash();
@@ -1565,6 +1824,11 @@ static bool dispatch(const std::string& line) {
                     } else {
                         uint32_t sym = 0;
                         if (findSymbol(t, sym)) { ok = true; pc = (uint16_t)(sym / 2); }
+                        else if (g_isrv.count(lower(t))) {
+                            // vector name from the chip profile [Interrupts] (e.g. TIMER1_OVF_vect)
+                            pc = (uint16_t)g_isrv[lower(t)]; ok = true;
+                            wr(fmt("-- bp: vector %s -> PC=0x%04X", t.c_str(), pc), DCYAN);
+                        }
                         else { ok = false; wr(fmt("bp add: cannot resolve symbol '%s'", t.c_str()), RED); }
                     }
                 }
@@ -1613,6 +1877,8 @@ static bool dispatch(const std::string& line) {
         for (int i = 0; i < n; i++) {
             uint16_t op; int cy;
             if (!execOne(op, cy)) break;
+            tickInts(cy);
+            dispatchPending();
             renderDash();
             Sleep(dms);
         }
@@ -1622,6 +1888,57 @@ static bool dispatch(const std::string& line) {
     if (cmd == "selftest") { runSelfTest(); return true; }
     if (cmd == "selftest2" || cmd == "st2") { runSelfTest2(); return true; }
     if (cmd == "quiet") { g_quiet = true; return true; }
+    if (cmd == "isr" || cmd == "iv") {
+        // interrupt dispatcher status (registers taken from profile [RegisterMap])
+        wr(fmt(" I=%d (SREG) | vectors in profile: %d", g_f.I, (int)g_isrv.size()), CYAN);
+        bool hasEimsk = g_regmap.count("eimsk") > 0;
+        bool hasTf0   = g_regmap.count("tifr0") > 0 && g_regmap.count("tifr1") == 0;
+        int iscIO  = (hasEimsk && g_regmap.count("eicra")) ? g_regmap["eicra"] : 0x55;
+        int flagIO = hasEimsk ? ((g_regmap.count("eifr"))  ? g_regmap["eifr"] : 0x3C) : 0x5A;
+        int enIO   = hasEimsk ? ((g_regmap.count("eimsk")) ? g_regmap["eimsk"] : 0x3D)
+                              : (hasTf0 ? ((g_regmap.count("gimsk")) ? g_regmap["gimsk"] : 0x5B)
+                                        : ((g_regmap.count("gicr"))    ? g_regmap["gicr"] : 0x5B));
+        uint8_t isc = readDmem(iscIO);
+        static const char* modeN[4] = { "low-level", "any change", "falling edge", "rising edge" };
+        struct X { int pinIO, bit, flagBit, enBit, iscM, vec; const char* nm; };
+        X e[2] = { { g_int0PinIO, g_int0Bit, 6, 6, 0, -1, "INT0_vect" },
+                   { g_int1PinIO, g_int1Bit, 7, 7, 2, -1, "INT1_vect" } };
+        if (hasEimsk) { e[0].flagBit = 0; e[0].enBit = 0; e[1].flagBit = 1; e[1].enBit = 1; }
+        for (int i = 0; i < 2; i++) {
+            auto vi = g_isrv.find(i == 0 ? "int0_vect" : "int1_vect");
+            if (vi == g_isrv.end()) continue;
+            e[i].vec = vi->second;
+            if (i == 1 && hasTf0) continue;
+            char pch = '?';
+            for (int k = 0; k < (int)g_pio.size(); k++)
+                if (g_pio[k].pin == e[i].pinIO) pch = (char)toupper((unsigned char)g_pname[k][0]);
+            uint8_t lvl = (uint8_t)((readDmem(0x20 + e[i].pinIO) >> e[i].bit) & 1);
+            int mode = (isc >> e[i].iscM) & 3;
+            wr(fmt("  %s pin=P%c%d level=%d <%s> en=%d flag=%d vec=#%d",
+                   e[i].nm, pch, e[i].bit, lvl, modeN[mode],
+                   (readDmem(enIO) >> e[i].enBit) & 1,
+                   (readDmem(flagIO) >> e[i].flagBit) & 1, e[i].vec), CYAN);
+        }
+        static const int base[8] = { 1, 1, 8, 64, 256, 1024, 1, 1 };
+        static const int t2tb[8] = { 1, 1, 8, 32, 64, 128, 256, 1024 };
+        for (int t = 0; t < 3; t++) {
+            if (!g_ts[t].have) continue;
+            int cs = readDmem(g_ts[t].tccr) & 7;
+            int n = (t == 2) ? t2tb[cs] : base[cs];
+            uint16_t tval = (uint16_t)(readDmem(g_ts[t].tcntL) & 0xFF);
+            if (g_ts[t].tcntH >= 0) tval = (uint16_t)(tval | ((readDmem(g_ts[t].tcntH) & 0xFF) << 8));
+            wr(fmt("  T%d TCCR CS=%d (%s) TCNT=0x%04X en=%d flag=%d",
+                   t, cs, n > 1 ? faPres(n) : "stopped", tval,
+                   (readDmem(g_ts[t].timsk) >> g_ts[t].toieBit) & 1,
+                   (readDmem(g_ts[t].tifr)  >> g_ts[t].tovBit) & 1), CYAN);
+        }
+        // vector table (index order)
+        std::vector<std::pair<int, std::string>> vt;
+        for (auto& kv : g_isrv) vt.push_back({ kv.second, upper(kv.first) });
+        std::sort(vt.begin(), vt.end());
+        for (auto& v : vt) wr(fmt("   #%d  %-17s @PC=0x%04X", v.first, v.second.c_str(), v.first), DGRAY);
+        return true;
+    }
     if (cmd == "help" || cmd == "?") {
         wr("Commands (README sec.12 + ext):", CYAN);
         wr("  load <elf> | reset(rst)            - load/reset program");
@@ -1632,8 +1949,8 @@ static bool dispatch(const std::string& line) {
         wr("  port <A|B|C|D>                     - port pins report (IN/OUT/PullUp)");
         wr("  pin <P#|P#bit> <v|toggle>          - stimulus");
         wr("  mem sram|flash <addr> [len]        - dump; write: mem sram 0x60 = 0xFF");
-        wr("  bp add|ba <addr|sym>  list|bl  del|bd <n|all>");
-        wr("  w <var|addr> (watch)   tr (timer reset)   sz size   da (disasm)");
+        wr("  bp add|ba <addr|sym|vect>  list|bl  del|bd <n|all>");
+        wr("  isr (int status)   w <var|addr> (watch)   tr (timer reset)   sz size   da (disasm)");
         wr("  selftest | selftest2 | quiet | quit(q)");
         return true;
     }
