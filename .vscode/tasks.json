@@ -1,0 +1,38 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "AVR CLI: сборка main.c",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "avr.ps1", "build"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "AVR CLI: загрузить в эмулятор",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "avr.ps1", "emu"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "AVR CLI: список чипов (flash <= 8 КБ)",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "avr.ps1", "pl", "8K"
+            ],
+            "problemMatcher": []
+        }
+    ]
+}

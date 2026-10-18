@@ -12,7 +12,7 @@ CC = "C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/bin/avr-gcc"
 OBJCOPY = "C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/bin/avr-objcopy"
 
 # Флаги компиляции
-CFLAGS = -mmcu=$(MCU) -DF_CPU=$(F_CPU) -O2 -Wall
+CFLAGS = -mmcu=$(MCU) -DF_CPU=$(F_CPU) -O0 -g -Wall
 
 all: $(TARGET).hex
 

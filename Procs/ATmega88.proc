@@ -2,8 +2,8 @@
 
 [Identity]
 Name = ATmega88
-MCU_Target = atmega88pa
-Define_Tag = __AVR_ATmega88PA__
+MCU_Target = atmega88
+Define_Tag = __AVR_ATmega88__
 Default_F_CPU = 8000000
 InstructSetCore = avr5
 

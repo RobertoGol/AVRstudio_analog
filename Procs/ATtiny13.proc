@@ -2,8 +2,8 @@
 
 [Identity]
 Name = ATtiny13
-MCU_Target = attiny13a
-Define_Tag = __AVR_ATtiny13A__
+MCU_Target = attiny13
+Define_Tag = __AVR_ATtiny13__
 Default_F_CPU = 1200000
 InstructSetCore = avr2
 

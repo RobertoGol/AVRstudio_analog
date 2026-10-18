@@ -388,8 +388,7 @@ static int  popWord() { int lo = popByte(); int hi = popByte(); return lo | (hi 
 // ---------------------------------------------------------------------
 static void setAddFlags(int a, int b, int r, int cin) {
     a &= 0xFF; b &= 0xFF; r &= 0xFF;
-    int c = (r < ((a + b + cin) & 0x1FF)) ? 1 : 0;
-    c = ((a + b + cin) > 0xFF) ? 1 : 0;
+    int c = ((a + b + cin) > 0xFF) ? 1 : 0;
     int h = ((a & 8) && ((b & 8) || !(r & 8))) | (!(a & 8) && (b & 8) && (r & 8));
     int n = (r >> 7) & 1, v = n ^ c;
     g_f.C = c; g_f.H = h; g_f.N = n; g_f.V = v; g_f.S = n ^ v; g_f.Z = (r == 0);
@@ -1034,7 +1033,7 @@ static std::string decodeOp(uint16_t op) {
     if ((op & 0xFE0F) == 0x9200) { snprintf(b, sizeof b, "STS  0x%04X, R%u", flashWord(g_pc+1), (op>>4)&0x1F); return b; }
     if ((op & 0xD200) == 0x8000) {
         int q = ((op&0x2000)>>8) | ((op&0x0C00)>>7) | (op&7);
-        snprintf(b, sizeof b, "%s R%u, %c+%d", (op&8)?"LDD":"LDD", (op>>4)&0x1F, (op&8)?'Y':'Z', q); return b;
+        snprintf(b, sizeof b, "LDD  R%u, %c+%d", (op>>4)&0x1F, (op&8)?'Y':'Z', q); return b;
     }
     if ((op & 0xD200) == 0x8200) {
         int q = ((op&0x2000)>>8) | ((op&0x0C00)>>7) | (op&7);
@@ -1919,16 +1918,17 @@ static bool dispatch(const std::string& line) {
                    (readDmem(enIO) >> e[i].enBit) & 1,
                    (readDmem(flagIO) >> e[i].flagBit) & 1, e[i].vec), CYAN);
         }
-        static const int base[8] = { 1, 1, 8, 64, 256, 1024, 1, 1 };
-        static const int t2tb[8] = { 1, 1, 8, 32, 64, 128, 256, 1024 };
+        static const int base[8] = { 0, 1, 8, 64, 256, 1024, 0, 0 };    // T0/T1: CS 6..7 = ext pin (не эмулируется)
+        static const int t2tb[8] = { 0, 1, 8, 32, 64, 128, 256, 1024 }; // T2
         for (int t = 0; t < 3; t++) {
             if (!g_ts[t].have) continue;
             int cs = readDmem(g_ts[t].tccr) & 7;
             int n = (t == 2) ? t2tb[cs] : base[cs];
+            const char* src = n > 1 ? faPres(n) : ((t != 2 && cs >= 6) ? "ext pin (не тикает)" : "stopped");
             uint16_t tval = (uint16_t)(readDmem(g_ts[t].tcntL) & 0xFF);
             if (g_ts[t].tcntH >= 0) tval = (uint16_t)(tval | ((readDmem(g_ts[t].tcntH) & 0xFF) << 8));
             wr(fmt("  T%d TCCR CS=%d (%s) TCNT=0x%04X en=%d flag=%d",
-                   t, cs, n > 1 ? faPres(n) : "stopped", tval,
+                   t, cs, src, tval,
                    (readDmem(g_ts[t].timsk) >> g_ts[t].toieBit) & 1,
                    (readDmem(g_ts[t].tifr)  >> g_ts[t].tovBit) & 1), CYAN);
         }

@@ -131,36 +131,59 @@ function Select-ProcImpl($name, $mhz) {
     }
     Write-Host ('  ЧПу:  ' + $chip + '  (target ' + $mcut + ', tag ' + $tag + ')') -ForegroundColor Green
     Write-Host ('  F_CPU: ' + (([int]$fcpu) / 1000000) + ' MHz   -> echo.ctos + Makefile + c_cpp_properties.json') -ForegroundColor Green
-    if ($tag -ne '__AVR_ATmega8__') {
-        Write-Host '  Внимание: ядро эмулятора emu.exe пока работает с профилем памяти' -ForegroundColor Yellow
-        Write-Host '  выбранного чипа через Procs-файл (FlashEnd/RamEnd/порты).' -ForegroundColor Yellow
-    }
     return $true
 }
 
-function Proc-ListImpl() {
-    Write-Host ('  Доступные профили (' + $Procs + '):') -ForegroundColor Cyan
-    Write-Host ('  {0,-14}{1,-14}{2:>9}{3:>9}{4:>8}{5:>8}' -f 'Name','MCU_Target','Flash','SRAM','EEPROM','Ports')
-    Get-ChildItem $Procs -Filter '*.proc' | ForEach-Object {
-        $p = Read-ProFile $_.FullName
-        $chip = $p['Identity|Name']; if ($chip -eq $null -or $chip -eq '') { $chip = [IO.Path]::GetFileNameWithoutExtension($_.Name) }
+function Proc-ListImpl($flt, $maxArg) {
+    # фильтры: proc list [подстрока] [макс.flash КБ];
+    # "proc list 8" = чипы с flash <= 8 КБ; "all" = сброс фильтров
+    # лимит памяти: строго с суффиксом K (8K), иначе число = подстрока имени
+    $maxK = -1
+    if ($maxArg -ne $null -and (('' + $maxArg) -imatch '^([0-9]+)[Kk]$')) { $maxK = [int]$Matches[1] }
+    if ($maxK -lt 0 -and $flt -ne $null -and (('' + $flt) -imatch '^([0-9]+)[Kk]$')) {
+        $maxK = [int]$Matches[1]
+        $flt = ''
+    }
+    if (($flt -ieq 'all') -or ($flt -ieq '*')) { $flt = '' }
+    $rows = New-Object System.Collections.ArrayList
+    $total = 0
+    $files = @(Get-ChildItem $Procs -Filter '*.proc' | Sort-Object Name)
+    $total = $files.Count
+    foreach ($fi in $files) {
+        $p = Read-ProFile $fi.FullName
+        $chip = $p['Identity|Name']; if ($chip -eq $null -or $chip -eq '') { $chip = [IO.Path]::GetFileNameWithoutExtension($fi.Name) }
         $t = $p['Identity|MCU_Target']; if ($t -eq $null) { $t = '-' }
         $fe = Parse-Tc $p['Memory|FlashEnd']
         $re = Parse-Tc $p['Memory|RamEnd']
         $rs = Parse-Tc $p['Memory|SRAMStart']
         $ee = (Parse-Tc $p['Memory|EepromEnd']) + 1
         $ports = 0
-        if (Test-Path $_.FullName) {
-            $inPort = $false
-            foreach ($l in (Get-Content $_.FullName)) {
-                $t2 = ($l + '').Trim()
-                if ($t2.StartsWith('[')) { $inPort = ($t2 -imatch '^\[ports\]'); }
-                elseif ($inPort -and $t2 -ne '' -and -not $t2.StartsWith('#') -and $t2.Contains('=')) { $ports++ }
-            }
+        $inPort = $false
+        foreach ($l in (Get-Content $fi.FullName)) {
+            $t2 = ($l + '').Trim()
+            if ($t2.StartsWith('[')) { $inPort = ($t2 -imatch '^\[ports\]'); }
+            elseif ($inPort -and $t2 -ne '' -and -not $t2.StartsWith('#') -and $t2.Contains('=')) { $ports++ }
         }
         $sram = ($re - $rs + 1) / 1024
-        Write-Host ('  ' + $chip.PadRight(14) + $t.PadRight(14) + (('' + ($fe+1)/1024) + 'K').PadLeft(4) + (('' + $sram) + 'K').PadLeft(7) + (('' + $ee) + 'B').PadLeft(6) + ('' + $ports).PadLeft(7))
+        $ok = $true
+        if ($flt -ne '') {
+            $rx = [regex]::Escape($flt)
+            $ok = (($chip -imatch $rx) -or ($t -imatch $rx) -or ($fi.BaseName -imatch $rx))
+        }
+        if ($ok -and ($maxK -ge 0)) {
+            $ok = (($fe + 1) / 1024) -le $maxK
+        }
+        if (-not $ok) { continue }
+        $sk = ([string]($fe + 1)).PadLeft(10, '0')
+        [void]$rows.Add(@{ SortKey = $sk; N = $chip; T = $t; F = (($fe + 1) / 1024); S = $sram; E = $ee; P = $ports })
     }
+    Write-Host ('  Каталог профилей (' + $Procs + '):') -ForegroundColor Cyan
+    Write-Host ('  {0,-14}{1,-14}{2:>9}{3:>9}{4:>8}{5:>8}' -f 'Name','MCU_Target','Flash','SRAM','EEPROM','Ports')
+    foreach ($r in $rows) {
+        $ss = $r['S']; if ($ss -lt 0) { $ss = 0 }
+        Write-Host ('  ' + $r['N'].PadRight(14) + $r['T'].PadRight(14) + (('' + [Math]::Round($r['F'], 2)) + 'K').PadLeft(5) + (('' + [Math]::Round($ss, 2)) + 'K').PadLeft(7) + (('' + $r['E']) + 'B').PadLeft(6) + ('' + $r['P']).PadLeft(7))
+    }
+    Write-Host ('  Всего: ' + $rows.Count + ' из ' + $total) -ForegroundColor Gray
 }
 
 # побитовые описания ключевых регистров (общие для семейства)
@@ -196,7 +219,12 @@ $BitInfo = @{
 }
 
 function Proc-InfoImpl($reg) {
+    # "proc info <чип>" - показать профиль другого чипа вместо активного
     $prof = Get-Cs 'ActiveSession' 'ProcessorProfile' 'ATmega8A'
+    if ($reg -ne '' -and (($reg -imatch '^[A-Za-z0-9_.-]+$') -and (Test-Path (Join-Path $Procs ($reg + '.proc'))))) {
+        $prof = $reg
+        $reg = ''
+    }
     $path = Join-Path $Procs ($prof + '.proc')
     if (-not (Test-Path $path)) {
         $alt = Get-ChildItem $Procs -Filter '*.proc' | Select-Object -First 1
@@ -219,12 +247,12 @@ function Proc-InfoImpl($reg) {
             Write-Host ('[' + $s + ']') -ForegroundColor Cyan
             $keys = $groups[$s]
             if ($s -eq 'Interrupts') { $keys = $keys | Sort-Object { [int]($_.Split('|')[1].Split('=')[0].Trim()) } }
-            foreach ($k in $keys) { Write-Host ('  ' + $k.Split('|')[1]) }
+            foreach ($k in $keys) { Write-Host ('  ' + $k.Split('|')[1] + ' = ' + $pf[$k]) }
             $groups.Remove($s)
         }
         foreach ($s in @($groups.Keys | Sort-Object)) {
             Write-Host ('[' + $s + ']') -ForegroundColor Cyan
-            foreach ($k in $groups[$s]) { Write-Host ('  ' + $k.Split('|')[1]) }
+            foreach ($k in $groups[$s]) { Write-Host ('  ' + $k.Split('|')[1] + ' = ' + $pf[$k]) }
         }
         $nreg = (($pf.Keys | Where-Object { $_.StartsWith('RegisterMap|') }).Count)
         Write-Host ('  Регистров в словаре: ' + $nreg) -ForegroundColor Gray
@@ -299,11 +327,20 @@ function Build-MemoryReport() {
     }
 }
 function Build-ImplOptions($args0) {
-    $opt = 'O0'
-    if ($args0.Count -ge 2) {
+    # умолчание берём из echo.ctos, явный выбор запоминаем туда же.
+    # Нормализация: O0..O3 - большие, s - строчный (GCC принимает только '-Os')
+    $nrm = { param($o) if ($o -imatch '^O([0-3s])$') { return 'O' + $Matches[1].ToLower() } else { return 'O0' } }
+    $opt = Get-Cs 'ActiveSession' 'Optimization' 'O0'
+    $opt = & $nrm $opt
+    $set = $false
+    if ($args0 -ne $null -and $args0.Count -ge 2) {
         for ($i = 1; $i -lt $args0.Count; $i++) {
-            if ($args0[$i] -imatch '^-?opt$' -and $args0.Count -gt $i+1) { $opt = ('' + $args0[$i+1]).ToUpper() }
-            elseif ($args0[$i] -imatch '^O[0-3s]$') { $opt = ('' + $args0[$i]).ToUpper() }
+            if ($args0[$i] -imatch '^-?opt$' -and $args0.Count -gt $i+1) { $opt = ('' + $args0[$i+1]); $set = $true }
+            elseif ($args0[$i] -imatch '^O([0-3s])$') { $opt = 'O' + $Matches[1]; $set = $true }
+        }
+        if ($set) {
+            $opt = & $nrm $opt
+            Write-IniKey 'ActiveSession' 'Optimization' $opt
         }
     }
     return $opt
@@ -426,7 +463,13 @@ function Invoke-Line($line) {
     if ($c -ieq 'proc' -or $c -ieq 'pl' -or $c -ieq 'ps' -or $c -ieq 'pi') {
         $sub = ''
         if ($parts.Count -ge 2) { $sub = $parts[1].ToLower() }
-        if ($c -ieq 'pl' -or ($c -ieq 'proc' -and $sub -eq 'list'))    { Proc-ListImpl; return $true }
+        if ($c -ieq 'pl' -or ($c -ieq 'proc' -and $sub -eq 'list')) {
+            $flt = ''; $mk = ''
+            $base = 1; if ($c -ieq 'proc') { $base = 2 }
+            if ($parts.Count -ge $base + 1) { $flt = $parts[$base] }
+            if ($parts.Count -ge $base + 2) { $mk = $parts[$base + 1] }
+            Proc-ListImpl $flt $mk; return $true
+        }
         if ($c -ieq 'pi' -or ($c -ieq 'proc' -and $sub -eq 'info')) {
             $reg = ''; $base = 1; if ($c -ieq 'proc') { $base = 2 }
             if ($parts.Count -ge $base + 1) { $reg = $parts[$base] }
