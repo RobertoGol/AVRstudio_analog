@@ -2,6 +2,7 @@
 // Стиль и расположение копируют AVR Studio 4 по скринов Pictures/1..25.png.
 // Этап M1 (каркас): главное окно, меню AS4, статусбар, Welcome-диалог,
 // правый док I/O View (модули -> регистры -> биты), нижний Message с табами.
+// RupertJ{RobertoGol}
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>

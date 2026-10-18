@@ -3,6 +3,7 @@
 //  C++ replacement of the AVR Studio 4 simulator (TUI dashboard).
 //  Build (host): g++ -O2 -std=c++17 -Wall -Wextra -o emu.exe emu.cpp
 //  Config source: echo.ctos + Procs/<Chip>.proc  (README sec. 8, 13.1)
+//  RupertJ{RobertoGol}
 // =====================================================================
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
