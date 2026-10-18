@@ -34,6 +34,18 @@ static int g_eeCR = 0x3C, g_eeDR = 0x3D, g_eeARL = 0x3E, g_eeARH = 0x3F;   // SR
 static std::string g_tioTx;
 static std::vector<uint8_t> g_tioRx;
 static int g_udr = -1, g_ucsrA = -1, g_ucsrB = -1;  // SRAM-адреса UDR/UCSRA/UCSRB (из профиля)
+
+// Trace (окно Trace в AVR Studio): история выполненных инструкций (кольцевой буфер)
+struct Trc { uint16_t pc; uint16_t op; uint64_t cy; };
+static std::vector<Trc> g_trc;
+static size_t g_trcNext = 0;
+static bool g_testmode = false;              // селфтесты не затрагивают Trace
+static const size_t TRC_CAP = 256;
+static void traceAdd(uint16_t pc, uint16_t op, uint64_t cy) {
+    if (g_testmode) return;
+    if (g_trc.size() < TRC_CAP) { g_trc.push_back({pc, op, cy}); g_trcNext = g_trc.size(); }
+    else { g_trc[g_trcNext] = {pc, op, cy}; g_trcNext = (g_trcNext + 1) % TRC_CAP; }
+}
 static uint16_t g_pc = 0;           // in WORDS
 static uint64_t g_cycles = 0;
 static bool     g_loaded = false;
@@ -724,6 +736,7 @@ static bool execOne(uint16_t& opOut, int& cyOut) {
     int pcB = g_pc * 2;
     if (pcB >= (int)FLASH_END) { g_running = false; return false; }
     uint16_t op = flashWord(g_pc);
+    traceAdd(g_pc, op, g_cycles);
     int nextPC = g_pc + 1, cy = 1;
     int rd, rr, k;
 
@@ -1248,9 +1261,12 @@ static int runSelfTest() {
         else { failCount++; wr(fmt("  [FAIL] %s: got %d (0x%X), want %d (0x%X)", nm, got, got, want, want), RED); }
     };
     wr("-- Emulator self-test (LDI/ADD/SUBI/SBIW + flags)", CYAN);
-    static const uint8_t prog[] = {0x05,0xE5, 0x13,0xE0, 0x01,0x0F, 0x00,0x56, 0x82,0xE3, 0xC2,0x97};
-    g_flash.assign(FLASH_END, 0xFF);
-    memcpy(g_flash.data(), prog, sizeof(prog));
+    g_testmode = true;   // не затрагивать Trace
+    {
+        static const uint8_t prog[] = {0x05,0xE5, 0x13,0xE0, 0x01,0x0F, 0x00,0x56, 0x82,0xE3, 0xC2,0x97};
+        g_flash.assign(FLASH_END, 0xFF);
+        memcpy(g_flash.data(), prog, sizeof(prog));
+    }
     std::fill(g_dmem.begin(), g_dmem.end(), 0);
     g_dmem[0x5D] = RAM_END & 0xFF; g_dmem[0x5E] = (RAM_END>>8)&0xFF;
     g_loaded = true; g_pc = 0; g_cycles = 0; g_f = {};
@@ -1267,6 +1283,7 @@ static int runSelfTest() {
     execOne(op, cy); tc("SBIW result = 0", g_dmem[24] | (g_dmem[25]<<8), 0);
                        tc("SBIW Z flag", g_f.Z, 1);
 
+    g_testmode = false;
     if (!failCount) wr(fmt(" Self-test: ALL PASSED (%d checks)", passCount), GREEN);
     else wr(fmt(" Self-test: %d FAILED", failCount), RED);
     return failCount;
@@ -1282,6 +1299,7 @@ static int runSelfTest2() {
         else { failCount++; wr(fmt("  [FAIL] %s: got 0x%02X, want 0x%02X", nm, got, want), RED); }
     };
     wr("-- Emulator self-test 2 (MOVW/MUL/LDS/STS/LDD/STD/BST/BLD/SBRS/SEC)", CYAN);
+    g_testmode = true;   // не затрагивать Trace
     static const uint8_t prog[] = {
         0x0F,0xEF,   // LDI R16,0xFF
         0x08,0x94,   // SEC  (BSET 0)
@@ -1332,6 +1350,7 @@ static int runSelfTest2() {
     execOne(op, cy);                                     // LDD R22, Z+2
     tc("LDD R22 = 0x0E", g_dmem[22], 0x0E);
 
+    g_testmode = false;
     if (!failCount) wr(fmt(" Self-test 2: ALL PASSED (%d checks)", passCount), GREEN);
     else wr(fmt(" Self-test 2: %d FAILED", failCount), RED);
     return failCount;
@@ -2035,7 +2054,7 @@ static bool dispatch(const std::string& line) {
         return true;
     }
     if (cmd == "iotree" || cmd == "ot") {
-        // I/O window: регистры профиля, сгруппированные по модулям периферии
+        // I/O window: регистры профиля по модулям периферии; страницы по 54 строки
         struct Grp { const char* nm; const char* pfx[9]; };
         static const Grp G[8] = {
             { "GPIO",    { "ddr", "port", "pin", "pinctrl", "vport", "gpio", "tcb_", 0, 0 } },
@@ -2065,21 +2084,87 @@ static bool dispatch(const std::string& line) {
             }
             bks[g >= 0 ? g : 8].push_back(n);
         }
-        std::string flt = lower(a(1));
-        wr(" I/O window (карта профиля):", CYAN);
+        // аргументы: ot [фильтр|страница] [страница]
+        std::string flt = ""; int page = 1;
+        std::string t1 = a(1), t2 = a(2);
+        bool okN; int v1 = parseNum(t1, okN);
+        if (!t1.empty() && okN) { page = v1; }
+        else {
+            flt = lower(t1);
+            int v2 = (int)parseNum(t2, okN);
+            if (!t2.empty() && okN && v2 > 0) page = v2;
+        }
+        if (page < 1) page = 1;
+        const int PP = 54;   // строк данных на страницу
+        int pageStart = (page - 1) * PP;
+        // счёт данных с фильтром
+        int totalD = 0;
+        for (int gi = 0; gi < 9; gi++)
+            for (auto& n : bks[gi])
+                if (flt.empty() || n.find(flt) != std::string::npos) totalD++;
+        if (totalD == 0) { wr(fmt(" Нет регистров по фильтру '%s'.", flt.c_str()), DGRAY); return true; }
+        int pages = (totalD + PP - 1) / PP;
+        if (pageStart >= totalD) page = pages;
+        pageStart = (page - 1) * PP;
+        wr(fmt(" I/O window (карта профиля), стр %d/%d, всего %d:", page, pages, totalD), CYAN);
+        int dn = 0;
         for (int gi = 0; gi < 9; gi++) {
             std::string gnm = (gi < 8) ? G[gi].nm : "CPU/WDT/прочее";
-            if (bks[gi].empty()) continue;
-            if (flt.empty()) wr(fmt(" [%s]", gnm.c_str()), YELLOW);
+            bool hdrDone = false;
             for (auto& n : bks[gi]) {
                 if (!flt.empty() && n.find(flt) == std::string::npos) continue;
+                if (dn < pageStart || dn >= pageStart + PP) { dn++; continue; }
+                if (!hdrDone && flt.empty()) {
+                    wr(fmt(" [%s]", gnm.c_str()), YELLOW);
+                    hdrDone = true;
+                }
                 int s = g_regmap[n];
                 if (s - 0x20 >= 0 && s - 0x20 <= 0x3F)
                     wr(fmt("   %-14s IO 0x%02X  0x%02X", upper(n).c_str(), s - 0x20, readDmem(s)));
                 else
                     wr(fmt("   %-14s SR 0x%04X 0x%02X", upper(n).c_str(), s, readDmem(s)));
+                dn++;
             }
         }
+        if (pages > 1) wr(fmt("   ... далее: iotree%s %d", (flt.empty() ? "" : " " + flt).c_str(), page + 1 <= pages ? page + 1 : pages), DGRAY);
+        return true;
+    }
+    if (cmd == "trc" || cmd == "trace") {
+        // Trace window: the last executed instructions (ring buffer, 256 in size)
+        int n = 16;
+        std::string t1 = a(1);
+        if (!t1.empty()) { bool ok4; int nn = parseNum(t1, ok4); if (ok4 && nn > 0) n = nn; }
+        if (n > (int)TRC_CAP) n = (int)TRC_CAP;
+        size_t total = g_trc.size();
+        if (total == 0) { wr(" Trace is empty (execute a few steps/stepi).", DGRAY); return true; }
+        size_t amount = (size_t)n < total ? (size_t)n : total;
+        wr(fmt(" Trace: last %u of %u", (unsigned)amount, (unsigned)total), CYAN);
+        for (size_t i = 0; i < amount; i++) {
+            size_t idx = (g_trcNext + TRC_CAP * 2 - i - 1) % TRC_CAP;
+            Trc& e = g_trc[idx];
+            wr(fmt("  CY=%11llu  PC=0x%04X  0x%04X  %s",
+                   (unsigned long long)e.cy, e.pc, e.op, decodeOp(e.op).c_str()), i == 0 ? CYAN : GRAY);
+        }
+        return true;
+    }
+    if (cmd == "bit" || cmd == "ib") {
+        // bit-by-bit stimulus, like clicking a bit in the I/O View window
+        std::string rn = upper(a(1)), bt = a(2), vs = a(3);
+        if (rn.empty() || bt.empty()) { wr(" format: bit <REG> <N> [0|1]  (without a value = toggle)", YELLOW); return true; }
+        auto it = g_regmap.find(lower(rn));
+        if (it == g_regmap.end()) { wr(" Register " + rn + " not found in the profile", RED); return true; }
+        bool ok5; int nb = parseNum(bt, ok5);
+        if (!ok5 || nb < 0 || nb > 7) { wr(" bit number 0..7", RED); return true; }
+        int s = it->second;
+        uint8_t v0 = (uint8_t)readDmem(s);
+        uint8_t nv;
+        if (!vs.empty()) {
+            bool ok6; int w = parseNum(vs, ok6);
+            if (!ok6 || (w != 0 && w != 1)) { wr(" value: 0 or 1", RED); return true; }
+            nv = w ? (uint8_t)(v0 | (1 << nb)) : (uint8_t)(v0 & ~(1 << nb));
+        } else nv = (uint8_t)(v0 ^ (1 << nb));
+        writeDmem(s, nv);
+        wr(fmt(" %s bit %d: 0x%02X -> 0x%02X", rn.c_str(), nb, v0, nv), GREEN);
         return true;
     }
     if (cmd == "auto" || cmd == "au") {
@@ -2167,7 +2252,8 @@ static bool dispatch(const std::string& line) {
         wr("  mem sram|flash <addr> [len]        - dump; write: mem sram 0x60 = 0xFF");
         wr("  bp add|ba <addr|sym|vect>  list|bl  del|bd <n|all>");
         wr("  isr (int status)   w <var|addr> (watch)   tr (timer reset)   sz size   da (disasm)");
-        wr("  iotree (ot) [filter] - window I/O by modules;  uart push|clear (tio) - \"screen\" Terminal I/O");
+        wr("  iotree (ot) [filter|page] - I/O window by modules;  trc [N] - Trace window");
+        wr("  bit <REG> <N> [0|1]        - set/toggle bit of register;  uart push|clear (tio)");
         wr("  selftest | selftest2 | quiet | quit(q)");
         return true;
     }
