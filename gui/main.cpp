@@ -127,12 +127,196 @@ static void registerCapClass() {
     RegisterClassA(&wc);
 }
 
-static void tbAddStr(HWND tb, int id, const char* text, int sep) {    TBBUTTON b = {0};
+static void tbAddStr(HWND tb, int id, const char* text, int sep) {
+    TBBUTTON b = {0};
     b.iBitmap = 0;
     b.idCommand = id;
     b.fsState = TBSTATE_ENABLED;
     b.fsStyle = (BYTE)(sep ? BTNS_SEP : BTNS_SHOWTEXT | BTNS_AUTOSIZE);
     b.iString = (INT_PTR)text;
+    SendMessageA(tb, TB_ADDBUTTONS, 1, (LPARAM)&b);
+}
+
+// ------------------------------------------------ Иконки тулбаров (скрин 7)
+// AS4-стиль: маленькие цветные иконки 16x16 + всплывающие подсказки, без подписей.
+static HIMAGELIST g_tbImg = nullptr;
+
+static HBITMAP makeGlyphBmp(int kind) {
+    HDC sdc = GetDC(nullptr);
+    HDC mdc = CreateCompatibleDC(sdc);
+    HBITMAP bmp = CreateCompatibleBitmap(sdc, 16, 16);
+    HGDIOBJ ob = SelectObject(mdc, bmp);
+    HBRUSH mag = CreateSolidBrush(RGB(255, 0, 255));
+    RECT r = { 0, 0, 16, 16 };
+    FillRect(mdc, &r, mag);
+    DeleteObject(mag);
+    auto rect = [&](int x, int y, int w, int h, COLORREF c) {
+        HBRUSH br = CreateSolidBrush(c);
+        RECT rr = { x, y, x + w, y + h };
+        FillRect(mdc, &rr, br);
+        DeleteObject(br);
+    };
+    auto frame = [&](int x, int y, int w, int h, COLORREF c) {
+        rect(x, y, w, 1, c); rect(x, y + h - 1, w, 1, c);
+        rect(x, y, 1, h, c); rect(x + w - 1, y, 1, h, c);
+    };
+    HPEN pen = nullptr; HGDIOBJ op = nullptr;
+    switch (kind) {
+        case 0:   // New File: белый лист с загнутым уголком
+            rect(3, 1, 10, 14, RGB(255, 255, 255));
+            frame(3, 1, 10, 14, RGB(64, 64, 64));
+            rect(9, 1, 4, 4, RGB(192, 192, 192));
+            rect(7, 5, 5, 1, RGB(160, 160, 160));
+            rect(5, 8, 7, 1, RGB(160, 160, 160));
+            rect(5, 10, 7, 1, RGB(160, 160, 160));
+            break;
+        case 1:   // Open: жёлтая папка
+            rect(2, 3, 6, 3, RGB(238, 201, 106));
+            rect(1, 5, 14, 8, RGB(252, 214, 117));
+            frame(1, 5, 14, 8, RGB(120, 84, 20));
+            break;
+        case 2:   // Save: синий флоппи
+            rect(1, 2, 14, 13, RGB(36, 74, 196));
+            frame(1, 2, 14, 13, RGB(16, 30, 100));
+            rect(4, 3, 8, 4, RGB(200, 200, 200));
+            rect(7, 3, 2, 3, RGB(80, 80, 80));
+            rect(3, 9, 10, 5, RGB(255, 255, 255));
+            rect(5, 10, 6, 1, RGB(120, 120, 120));
+            rect(5, 12, 6, 1, RGB(120, 120, 120));
+            break;
+        case 3: { // Build: молоток
+            HPEN hp = CreatePen(PS_SOLID, 3, RGB(146, 92, 40));
+            op = SelectObject(mdc, hp);
+            MoveToEx(mdc, 3, 13, 0); LineTo(mdc, 11, 5);
+            SelectObject(mdc, op);
+            DeleteObject(hp);
+            rect(8, 2, 7, 5, RGB(150, 150, 160));
+            frame(8, 2, 7, 5, RGB(60, 60, 70));
+            break;
+        }
+        case 4: case 6: { // Run/Build-and-Run: зелёная стрелка
+            POINT tri[3] = { {4, 2}, {4, 13}, {14, 8} };
+            HBRUSH gb = CreateSolidBrush(RGB(0, 148, 44));
+            HPEN noPen = (HPEN)GetStockObject(NULL_PEN);
+            op = SelectObject(mdc, noPen); HGDIOBJ ob2 = SelectObject(mdc, gb);
+            Polygon(mdc, tri, 3);
+            SelectObject(mdc, op); SelectObject(mdc, ob2);
+            DeleteObject(gb);
+            if (kind == 4) frame(1, 10, 2, 4, RGB(64, 64, 64));  // листик-черта = build
+            break;
+        }
+        case 5: {  // Start Debugging: микросхема
+            rect(4, 4, 8, 8, RGB(40, 120, 190));
+            frame(4, 4, 8, 8, RGB(10, 40, 90));
+            for (int i = 0; i < 3; i++) {
+                rect(6 + i * 3, 2, 1, 2, RGB(120, 120, 120));
+                rect(6 + i * 3, 12, 1, 2, RGB(120, 120, 120));
+                rect(2, 6 + i * 3, 2, 1, RGB(120, 120, 120));
+                rect(12, 6 + i * 3, 2, 1, RGB(120, 120, 120));
+            }
+            break;
+        }
+        case 7:    // Break: две красные полосы
+            rect(4, 2, 3, 12, RGB(204, 60, 40));
+            rect(9, 2, 3, 12, RGB(204, 60, 40));
+            break;
+        case 8: {  // Reset: круговая стрелка
+            HPEN hp = CreatePen(PS_SOLID, 2, RGB(210, 140, 20));
+            op = SelectObject(mdc, hp);
+            Arc(mdc, 2, 3, 14, 13, 13, 5, 3, 6);
+            MoveToEx(mdc, 13, 5, 0); LineTo(mdc, 10, 4); LineTo(mdc, 12, 8);
+            SelectObject(mdc, op);
+            DeleteObject(hp);
+            break;
+        }
+        case 9: {  // Step Into: стрелка вниз к точке
+            HPEN hp = CreatePen(PS_SOLID, 2, RGB(40, 40, 190));
+            op = SelectObject(mdc, hp);
+            MoveToEx(mdc, 8, 2, 0); LineTo(mdc, 8, 10);
+            SelectObject(mdc, op);
+            DeleteObject(hp);
+            POINT tri[3] = { {4, 9}, {12, 9}, {8, 14} };
+            HBRUSH gb = CreateSolidBrush(RGB(40, 40, 190));
+            HPEN noPen = (HPEN)GetStockObject(NULL_PEN);
+            op = SelectObject(mdc, noPen); HGDIOBJ ob2 = SelectObject(mdc, gb);
+            Polygon(mdc, tri, 3);
+            SelectObject(mdc, op); SelectObject(mdc, ob2);
+            DeleteObject(gb);
+            rect(5, 14, 7, 2, RGB(40, 40, 190));
+            break;
+        }
+        case 10: { // Step Over: дуга над точкой
+            HPEN hp = CreatePen(PS_SOLID, 2, RGB(40, 40, 190));
+            op = SelectObject(mdc, hp);
+            Arc(mdc, 2, 4, 14, 14, 13, 12, 3, 12);
+            MoveToEx(mdc, 3, 12, 0); LineTo(mdc, 6, 10); LineTo(mdc, 6, 14);
+            SelectObject(mdc, op);
+            DeleteObject(hp);
+            rect(6, 7, 4, 3, RGB(40, 40, 190));
+            break;
+        }
+        case 11: { // Step Out: стрелка вверх из точки
+            HPEN hp = CreatePen(PS_SOLID, 2, RGB(40, 40, 190));
+            op = SelectObject(mdc, hp);
+            MoveToEx(mdc, 8, 11, 0); LineTo(mdc, 8, 3);
+            SelectObject(mdc, op);
+            DeleteObject(hp);
+            POINT tri[3] = { {4, 5}, {12, 5}, {8, 1} };
+            HBRUSH gb = CreateSolidBrush(RGB(40, 40, 190));
+            HPEN noPen = (HPEN)GetStockObject(NULL_PEN);
+            op = SelectObject(mdc, noPen); HGDIOBJ ob2 = SelectObject(mdc, gb);
+            Polygon(mdc, tri, 3);
+            SelectObject(mdc, op); SelectObject(mdc, ob2);
+            DeleteObject(gb);
+            rect(5, 12, 7, 2, RGB(40, 40, 190));
+            break;
+        }
+    }
+    SelectObject(mdc, ob);
+    DeleteDC(mdc);
+    ReleaseDC(nullptr, sdc);
+    return bmp;
+}
+
+static void tbInitIcons(HWND tb) {
+    if (!g_tbImg) {
+        g_tbImg = ImageList_Create(16, 16, ILC_COLOR24 | ILC_MASK, 12, 8);
+        for (int k = 0; k < 12; k++) {
+            HBITMAP b = makeGlyphBmp(k);
+            ImageList_AddMasked(g_tbImg, b, RGB(255, 0, 255));
+            DeleteObject(b);
+        }
+    }
+    SendMessageA(tb, TB_SETIMAGELIST, 0, (LPARAM)g_tbImg);
+}
+
+static void tbAddIcon(HWND tb, int id, int imgIdx) {
+    TBBUTTON b = {0};
+    b.iBitmap = imgIdx;
+    b.idCommand = id;
+    b.fsState = TBSTATE_ENABLED;
+    b.fsStyle = BTNS_BUTTON;
+    b.iString = (INT_PTR)-1;      // только иконка (скрин 7); текст даём через tooltip
+    SendMessageA(tb, TB_ADDBUTTONS, 1, (LPARAM)&b);
+}
+
+// tooltip-тексты по индексам кнопок (включая разделители)
+static void tbTips(HWND tb, const char* const* tips, int n) {
+    HWND tt = (HWND)SendMessageA(tb, TB_GETTOOLTIPS, 0, 0);
+    if (!tt) return;
+    for (int i = 0; i < n; i++) {
+        TOOLINFOA ti = {0};
+        ti.cbSize = sizeof(ti);
+        ti.hwnd = tb;
+        ti.uId = (UINT_PTR)i;
+        ti.lpszText = (LPSTR)tips[i];
+        SendMessageA(tt, TTM_UPDATETIPTEXTA, 0, (LPARAM)&ti);
+    }
+}
+
+static void tbSep(HWND tb) {
+    TBBUTTON b = {0};
+    b.fsStyle = BTNS_SEP;
     SendMessageA(tb, TB_ADDBUTTONS, 1, (LPARAM)&b);
 }
 
@@ -1476,32 +1660,39 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     g_main = CreateWindowExA(0, "AVRCLIStudio_Main", "AVR Studio", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1200, 800, 0, mb, hInst, 0);
 
-    // --- Тулбары (скрин 1/7: Standard сверху, Debug под ним) — текстовые кнопки, иконки на M2
+    // --- Тулбары (скрин 1/7): Standard сверху, Debug под ним — иконки 16x16 + tooltips
     g_tbStd = CreateWindowExA(0, TOOLBARCLASSNAMEA, 0,
-        WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | CCS_NORESIZE | CCS_NODIVIDER,
+        WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | CCS_NORESIZE | CCS_NODIVIDER,
         0, 0, 1200, 26, g_main, (HMENU)210, hInst, 0);
     SendMessageA(g_tbStd, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
-    tbAddStr(g_tbStd, IDM_FILE_NEW,   "New", 0);
-    tbAddStr(g_tbStd, IDM_FILE_OPEN,  "Open", 0);
-    tbAddStr(g_tbStd, IDM_FILE_SAVE,  "Save", 0);
-    tbAddStr(g_tbStd, 0, "", 1);
-    tbAddStr(g_tbStd, IDM_BUILD_BUILD, "Build", 0);
-    tbAddStr(g_tbStd, IDM_BUILD_COMPILE, "Build and Run", 0);
+    tbInitIcons(g_tbStd);
+    tbAddIcon(g_tbStd, IDM_FILE_NEW,   0);
+    tbAddIcon(g_tbStd, IDM_FILE_OPEN,  1);
+    tbAddIcon(g_tbStd, IDM_FILE_SAVE,  2);
+    tbSep(g_tbStd);
+    tbAddIcon(g_tbStd, IDM_BUILD_BUILD,   3);
+    tbAddIcon(g_tbStd, IDM_BUILD_COMPILE, 4);
+    { static const char* tips[] = { "New File", "Open File", "Save", "", "Build", "Build and Run" };
+      tbTips(g_tbStd, tips, 6); }
     SendMessageA(g_tbStd, TB_AUTOSIZE, 0, 0);
 
     g_tbDbg = CreateWindowExA(0, TOOLBARCLASSNAMEA, 0,
-        WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | CCS_NORESIZE | CCS_NODIVIDER,
+        WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | CCS_NORESIZE | CCS_NODIVIDER,
         0, 0, 1200, 26, g_main, (HMENU)211, hInst, 0);
     SendMessageA(g_tbDbg, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
-    tbAddStr(g_tbDbg, IDM_DBG_START,   "Start", 0);
-    tbAddStr(g_tbDbg, IDM_DBG_RUN,     "Run", 0);
-    tbAddStr(g_tbDbg, IDM_DBG_BREAK,   "Break", 0);
-    tbAddStr(g_tbDbg, 0, "", 1);
-    tbAddStr(g_tbDbg, IDM_DBG_RESET,   "Reset", 0);
-    tbAddStr(g_tbDbg, 0, "", 1);
-    tbAddStr(g_tbDbg, IDM_DBG_STEPIN,   "Step Into", 0);
-    tbAddStr(g_tbDbg, IDM_DBG_STEPOVER, "Step Over", 0);
-    tbAddStr(g_tbDbg, IDM_DBG_STEPOUT,  "Step Out", 0);
+    tbInitIcons(g_tbDbg);
+    tbAddIcon(g_tbDbg, IDM_DBG_START,   5);
+    tbSep(g_tbDbg);
+    tbAddIcon(g_tbDbg, IDM_DBG_RUN,     6);
+    tbAddIcon(g_tbDbg, IDM_DBG_BREAK,   7);
+    tbSep(g_tbDbg);
+    tbAddIcon(g_tbDbg, IDM_DBG_RESET,   8);
+    tbSep(g_tbDbg);
+    tbAddIcon(g_tbDbg, IDM_DBG_STEPIN,   9);
+    tbAddIcon(g_tbDbg, IDM_DBG_STEPOVER, 10);
+    tbAddIcon(g_tbDbg, IDM_DBG_STEPOUT,  11);
+    { static const char* tips[] = { "Start Debugging", "", "Run", "Break", "", "Reset", "", "Step Into", "Step Over", "Step Out" };
+      tbTips(g_tbDbg, tips, 10); }
     SendMessageA(g_tbDbg, TB_AUTOSIZE, 0, 0);
 
     // --- Центральный редактор (скрин 17: MDI-child с гуттером строк; MDI на M3, пока EDIT)
