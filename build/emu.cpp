@@ -2409,7 +2409,7 @@ int main(int argc, char** argv) {
 
     wr("================================================================================");
     wr(fmt("  AVR CLI Studio (C++)  |  Core: %s  |  F_CPU = %u Hz", g_chip.c_str(), g_fcpu), CYAN);
-    wr("  Type 'help' for commands.                                      (emu.cpp v1.0)", DCYAN);
+    wr("  Type 'help' for commands.                                      (emu.cpp v1.2)", DCYAN);
     wr("================================================================================");
 
     if (!runScript.empty()) {
