@@ -1,4 +1,5 @@
-# AVR CLI Studio processor profile - AUTOGEN from io90scr100.h (device alias AT90SCR100H) (tools/genprocs.ps1)
+# device alias of AT90SCR100 (нет отдельного заголовка в тулчейне 4.5.1)
+# AVR CLI Studio processor profile - AUTOGEN from io90scr100.h (tools/genprocs.ps1)
 # Источник: заголовок тулчейна avr-gcc. Ручные правки потеряются при -Overwrite.
 
 [Identity]

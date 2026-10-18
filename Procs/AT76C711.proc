@@ -7,9 +7,6 @@ MCU_Target = at76c711
 Define_Tag = __AVR_AT76C711__
 Default_F_CPU = 1000000
 
-[Signature]
-Signature = 0x00 0x00 0x00   # device id (SPM BLBSET / avrdude)
-
 [Memory]
   FlashEnd = 0x3FFF            # последний байт Flash (16 КБ)
   SRAMStart = 0x0060            # начало ОЗУ данных

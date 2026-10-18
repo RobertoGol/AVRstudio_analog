@@ -20,9 +20,7 @@ Signature = 0x1E 0x91 0x81   # device id (SPM BLBSET / avrdude)
 # порты вне I/O-пространства (расширенные или отсутствуют)
 
 [Interrupts]
-1 = SIG_TXDONE
 1 = TXDONE_vect
-2 = SIG_TXBE
 2 = TXEMPTY_vect
 
 [RegisterMap]

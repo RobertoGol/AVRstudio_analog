@@ -20,22 +20,13 @@ Signature = 0x1E 0x90 0x06   # device id (SPM BLBSET / avrdude)
   B = 0x16 0x17 0x18
 
 [Interrupts]
-1 = SIG_INTERRUPT0
 1 = INT0_vect
-2 = SIG_PIN_CHANGE
-2 = SIG_PIN
 2 = IO_PINS_vect
-3 = SIG_OUTPUT_COMPARE1A
 3 = TIMER1_COMP_vect
-4 = SIG_OVERFLOW1
 4 = TIMER1_OVF_vect
-5 = SIG_OVERFLOW0
 5 = TIMER0_OVF_vect
-6 = SIG_EEPROM_READY
 6 = EE_RDY_vect
-7 = SIG_COMPARATOR
 7 = ANA_COMP_vect
-8 = SIG_ADC
 8 = ADC_vect
 
 [RegisterMap]

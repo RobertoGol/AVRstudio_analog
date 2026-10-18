@@ -7,9 +7,6 @@ MCU_Target = atmega32hvbrevb
 Define_Tag = __AVR_ATmega32HVBREVB__
 Default_F_CPU = 1000000
 
-[Signature]
-Signature = 0x00 0x00 0x00   # device id (SPM BLBSET / avrdude)
-
 [Memory]
   FlashEnd = 0x7FFF            # последний байт Flash (32 КБ)
   SRAMStart = 0x0060            # начало ОЗУ данных

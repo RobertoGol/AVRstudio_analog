@@ -7,9 +7,6 @@ MCU_Target = at90s2333
 Define_Tag = __AVR_AT90S2333__
 Default_F_CPU = 1000000
 
-[Signature]
-Signature = 0x00 0x00 0x00   # device id (SPM BLBSET / avrdude)
-
 [Memory]
   FlashEnd = 0x07FF            # последний байт Flash (2 КБ)
   SRAMStart = 0x0060            # начало ОЗУ данных
@@ -22,31 +19,18 @@ Signature = 0x00 0x00 0x00   # device id (SPM BLBSET / avrdude)
   D = 0x10 0x11 0x12
 
 [Interrupts]
-1 = SIG_INTERRUPT0
 1 = INT0_vect
-2 = SIG_INTERRUPT1
 2 = INT1_vect
-3 = SIG_INPUT_CAPTURE1
 3 = TIMER1_CAPT_vect
-4 = SIG_OUTPUT_COMPARE1A
 4 = TIMER1_COMP_vect
-5 = SIG_OVERFLOW1
 5 = TIMER1_OVF_vect
-6 = SIG_OVERFLOW0
 6 = TIMER0_OVF_vect
-7 = SIG_SPI
 7 = SPI_STC_vect
-8 = SIG_UART_RECV
 8 = UART_RX_vect
-9 = SIG_UART_DATA
 9 = UART_UDRE_vect
-10 = SIG_UART_TRANS
 10 = UART_TX_vect
-11 = SIG_ADC
 11 = ADC_vect
-12 = SIG_EEPROM_READY
 12 = EE_RDY_vect
-13 = SIG_COMPARATOR
 13 = ANA_COMP_vect
 
 [RegisterMap]

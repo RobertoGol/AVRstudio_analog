@@ -65,7 +65,7 @@ foreach ($ln in [IO.File]::ReadAllLines((Join-Path $Inc 'io.h'), [Text.Encoding]
         foreach ($m in $ms) { [void]$held.Add($m.Groups[1].Value) }
         continue
     }
-    if ($l -match '^#\s*include\s+<avr/(io[A-Za-z0-9]+)\.h>') {
+    if ($l -match '^#\s*include\s+<avr/(io[A-Za-z0-9_]+)\.h>') {
         $hdr = $Matches[1]
         foreach ($t in $held) { [void]$map.Add(@{ Tag = $t; Header = $hdr }) }
         $held.Clear()
@@ -191,7 +191,14 @@ $Stubs = @{
 foreach ($e in $map) {
     $tag = $e.Tag; $hdr = $e.Header
     $out = Join-Path $Procs ($tag + '.proc')
-    if ((Test-Path $out) -and -not $Overwrite) { $skipped++; continue }
+    if (Test-Path $out) {
+        # перегенерируем только AUTOGEN; ручные профили защищены
+        $isAuto = $false
+        foreach ($oln in ([IO.File]::ReadAllLines($out, [Text.Encoding]::UTF8) | Select-Object -First 3)) {
+            if ($oln -match 'AUTOGEN') { $isAuto = $true }
+        }
+        if (-not $isAuto -and -not $Overwrite) { $skipped++; continue }
+    }
 
     $path = Join-Path $Inc ($hdr + '.h')
     if (-not (Test-Path $path)) {
@@ -200,6 +207,24 @@ foreach ($e in $map) {
         continue
     }
     $d = Parse-Header $path
+    # обёрточные заголовки (iom48.h, iom1280.h, iotn25.h, ...) тянут регистры и
+    # векторы из семейных (iomx8, iomxx0_1, iotnx5, iocanxx, iousbxx*): идём за #include
+    if ($d.regs.Count -eq 0 -or $d.vect.Count -eq 0) {
+        foreach ($ln in [IO.File]::ReadAllLines($path, [Text.Encoding]::UTF8)) {
+            if ($ln -match '^#include\s+<avr/(io[A-Za-z0-9_]+)\.h>') {
+                $ih = $Matches[1]
+                $ipath = Join-Path $Inc ($ih + '.h')
+                if (Test-Path $ipath) {
+                    $d2 = Parse-Header $ipath
+                    if ($d.regs.Count -eq 0) { $d.regs = $d2.regs }
+                    if ($d.vect.Count  -eq 0) { $d.vect  = $d2.vect }
+                    if ($d.ioend -lt 0 -and $d2.ioend -ge 0) { $d.ioend = $d2.ioend }
+                    if ($d.spm -lt 0 -and $d2.spm -ge 0) { $d.spm = $d2.spm }
+                    if ($d.sig[0] -le 0 -and $d2.sig[0] -gt 0) { $d.sig = $d2.sig; $d.e2 = $d2.e2 }
+                }
+            }
+        }
+    }
     if ($d.flash -lt 0 -and $Stubs.ContainsKey($tag)) {
         $d.flash = $Stubs[$tag].Flash; $d.ram = $Stubs[$tag].Ram; $d.e2 = $Stubs[$tag].E2
         Write-Host ('  ~ ' + $tag + ': геометрия из таблицы-исключения (заглушка ' + $hdr + '.h)') -ForegroundColor DarkCyan
@@ -238,10 +263,17 @@ foreach ($e in $map) {
         $rm += ('{0}|{1}|0x{2:X2}' -f $key, $g.K, $g.A) + "`r`n"
     }
 
-    # --- Interrupts ---
+    # --- Interrupts: уникальный индекс, приоритет современного *_vect ---
+    $vd = @{}
+    foreach ($v in $d.vect) {
+        if ($v.N -imatch '_vect$' -and -not $vd.ContainsKey($v.I)) { $vd[$v.I] = $v.N }
+    }
+    foreach ($v in $d.vect) {
+        if (-not $vd.ContainsKey($v.I)) { $vd[$v.I] = $v.N }
+    }
     $vi = ''
-    foreach ($v in @($d.vect | Sort-Object { $_.I })) {
-        $vi += ('{0} = {1}' -f $v.I, $v.N) + "`r`n"
+    foreach ($k in @($vd.Keys | Sort-Object)) {
+        $vi += ('{0} = {1}' -f $k, $vd[$k]) + "`r`n"
     }
 
     # --- Signature + Memory ---
@@ -299,7 +331,6 @@ $Aliases = @{
 }
 foreach ($aName in $Aliases.Keys) {
     $aliasEx = Join-Path $Procs ($aName + '.proc')
-    if ((Test-Path $aliasEx) -and -not $Overwrite) { continue }
     $srcA = Join-Path $Procs ($Aliases[$aName] + '.proc')
     if (-not (Test-Path $srcA)) {
         Write-Host ('  ! Алиас ' + $aName + ': нет источника ' + $Aliases[$aName]) -ForegroundColor DarkYellow

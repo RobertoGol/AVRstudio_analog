@@ -35,7 +35,6 @@ Default_F_CPU = 1000000
 19 = VADC_VADCCF_vect
 20 = VADC_VADCPROTF_vect
 21 = CADC_CADCCF_vect
-22 = NVM_EE_vect
 22 = CADC_CADCSM_vect
 23 = NVM_SPM_vect
 

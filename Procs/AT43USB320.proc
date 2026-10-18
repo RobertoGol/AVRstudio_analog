@@ -7,9 +7,6 @@ MCU_Target = at43usb320
 Define_Tag = __AVR_AT43USB320__
 Default_F_CPU = 1000000
 
-[Signature]
-Signature = 0x00 0x00 0x00   # device id (SPM BLBSET / avrdude)
-
 [Memory]
   FlashEnd = 0xFFFF            # последний байт Flash (64 КБ)
   SRAMStart = 0x0060            # начало ОЗУ данных
@@ -26,7 +23,6 @@ Signature = 0x00 0x00 0x00   # device id (SPM BLBSET / avrdude)
 [Interrupts]
 1 = SIG_INTERRUPT0
 2 = SIG_INTERRUPT1
-3 = SIG_INPUT_CAPTURE1
 3 = SIG_TIMER1_CAPT1
 4 = SIG_OUTPUT_COMPARE1A
 5 = SIG_OUTPUT_COMPARE1B
