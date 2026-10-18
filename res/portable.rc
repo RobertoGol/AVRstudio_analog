@@ -1,0 +1,4 @@
+// ресурсы портативной сборки AVR CLI Studio
+// 1 = RCDATA procpack.bin (все 207 профилей чипов одним blob'ом;
+//     распаковывается в <каталог exe>/../Procs при первом запуске)
+1 RCDATA "procpack.bin"

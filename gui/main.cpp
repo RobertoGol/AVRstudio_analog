@@ -502,8 +502,46 @@ static std::string folderNameOf(const std::string& p) {
     return sl != std::string::npos ? s.substr(sl + 1) : s;
 }
 
-static void browseLocation(HWND h, int editId) {
-    char buf[MAX_PATH] = "";
+// --------------------------------------------------- Портативный режим
+// В сборке "one exe" 207 профилей чипов зашиты ресурсом (res/portable.rc):
+// если рядом с exe нет каталога Procs - распаковываем из ресурса при старте.
+static std::string g_portableNote;   // заметка для Message-панели после создания окна
+
+static void ensurePortableProcs() {
+    std::string dir = g_appDir + "/../Procs";
+    if (dir.find("..") != std::string::npos) {
+        // нормализуем .. для FindFirstFile/CreateProcess
+        char full[MAX_PATH]; GetFullPathNameA(dir.c_str(), MAX_PATH, full, nullptr);
+        dir = full;
+    }
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "/*.proc").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) { FindClose(h); return; }   // каталог уже с профилями
+
+    HRSRC rs = FindResourceA(nullptr, MAKEINTRESOURCEA(1), RT_RCDATA);
+    if (!rs) return;                                           // не портативная сборка - будет "профилям нет"
+    HGLOBAL gl = LoadResource(nullptr, rs);
+    const unsigned char* p = (const unsigned char*)LockResource(gl);
+    DWORD sz = SizeofResource(nullptr, rs);
+    if (!p || sz < 4) return;
+    DWORD n = *(const DWORD*)p;
+    const unsigned char* q = p + 4;
+    CreateDirectoryA(dir.c_str(), nullptr);
+    DWORD written = 0;
+    for (DWORD f = 0; f < n && (DWORD)(q - p) < sz; f++) {
+        WORD nameLen = *(const WORD*)q; q += 2;
+        std::string name((const char*)q, nameLen); q += nameLen;
+        DWORD dataLen = *(const DWORD*)q; q += 4;
+        std::string path = dir + "/" + name;
+        FILE* fo = fopen(path.c_str(), "wb");
+        if (fo) { fwrite(q, 1, dataLen, fo); fclose(fo); written++; }
+        q += dataLen;
+    }
+    g_portableNote = std::string("Portable: extracted ") + std::to_string(written) +
+                     " device profiles -> " + dir;
+}
+
+static void browseLocation(HWND h, int editId) {    char buf[MAX_PATH] = "";
     BROWSEINFOA bi = {0};
     bi.hwndOwner = h; bi.lpszTitle = "Выберите папку проекта"; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
     LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
@@ -1050,6 +1088,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     SetUnhandledExceptionFilter(crashFilter);
     g_appDir = exeDirNow();
     loadRecent();
+    ensurePortableProcs();
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES
         | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
@@ -1239,6 +1278,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
 
     msgAppend("Project is ready and can be saved");
     ShowWindow(g_main, nShow);
+    if (!g_portableNote.empty()) msgAppend(g_portableNote.c_str());
     UpdateWindow(g_main);
 
     // акселераторы как в AS4 (подписи в меню): F5 Run, F10 Step Over, F11 Step Into,
