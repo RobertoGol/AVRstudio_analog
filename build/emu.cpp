@@ -28,6 +28,12 @@ static uint16_t RAM_END   = 0x045F;
 static std::vector<uint8_t> g_flash(FLASH_END, 0xFF);
 static std::vector<uint8_t> g_dmem(DMEM_SIZE, 0);
 static std::vector<uint8_t> g_eeprom;     // real EEPROM backing (init 0xFF, persists across reset like hardware)
+static int g_eeCR = 0x3C, g_eeDR = 0x3D, g_eeARL = 0x3E, g_eeARH = 0x3F;   // SRAM-адреса EECR/EEDR/EEAR (из профиля)
+
+// Terminal I/O (как в AVR Studio): TX-лог (записи в UDR) + очередь RX
+static std::string g_tioTx;
+static std::vector<uint8_t> g_tioRx;
+static int g_udr = -1, g_ucsrA = -1, g_ucsrB = -1;  // SRAM-адреса UDR/UCSRA/UCSRB (из профиля)
 static uint16_t g_pc = 0;           // in WORDS
 static uint64_t g_cycles = 0;
 static bool     g_loaded = false;
@@ -256,6 +262,18 @@ static void loadEnv() {
         }
     }
 
+    // USART/EEPROM регистры: адреса берём из профиля (не хардкод под ATmega8)
+    {
+        auto rr = [&](const char* n) -> int { auto i = g_regmap.find(n); return i != g_regmap.end() ? i->second : -1; };
+        g_udr   = rr("udr");   if (g_udr   < 0) g_udr   = rr("udr0");
+        g_ucsrA = rr("ucsra"); if (g_ucsrA < 0) g_ucsrA = rr("ucsra0");
+        g_ucsrB = rr("ucsrb"); if (g_ucsrB < 0) g_ucsrB = rr("ucsr0b");
+        g_eeCR  = rr("eecr");  g_eeDR = rr("eedr");
+        g_eeARL = rr("eearl"); g_eeARH = rr("eearh");
+        if (g_eeARL < 0 && g_eeARH < 0) g_eeARL = rr("eear");   // однобайтный EEAR у старых/tiny чипов
+        if (g_eeCR < 0 || g_eeDR < 0 || g_eeARL < 0) { g_eeCR = 0x3C; g_eeDR = 0x3D; g_eeARL = 0x3E; g_eeARH = 0x3F; }  // мега8-легаси
+    }
+
     // [Interrupts] rows "INDEX = NAME_vectors" -> vector table (PC word == index)
     g_isrv.clear();
     for (auto& kv : p) {
@@ -341,23 +359,43 @@ static uint8_t readDmem(int a) {
     if (a == 0x20 + 0x3F) { // SREG
         return (g_f.I<<7)|(g_f.T<<6)|(g_f.H<<5)|(g_f.S<<4)|(g_f.V<<3)|(g_f.N<<2)|(g_f.Z<<1)|(g_f.C);
     }
+    if (a == g_udr && g_udr >= 0) {
+        // ЧТЕНИЕ UDR (Terminal I/O): выдаём принятый байт, RXC сбрасывается;
+        // если в RX-очереди ещё есть байт — подгружаем его в UDR и снова ставим RXC
+        uint8_t c = g_dmem[g_udr];
+        g_dmem[g_udr] = 0;
+        if (g_ucsrA >= 0) g_dmem[g_ucsrA] &= ~0x80;             // RXC = 0
+        if (!g_tioRx.empty()) {
+            g_dmem[g_udr] = g_tioRx[0];
+            g_tioRx.erase(g_tioRx.begin());
+            if (g_ucsrA >= 0 && !g_tioRx.empty()) g_dmem[g_ucsrA] |= 0x80;   // RXC для очередного
+        }
+        return c;
+    }
     return g_dmem[a];
 }
 static void writeDmem(int a, int val) {
     val &= 0xFF;
+    if (a == g_udr && g_udr >= 0 && a < (int)DMEM_SIZE) {
+        // Terminal I/O: запись в UDR = передача (как в AVR Studio)
+        if ((int)g_tioTx.size() < 8192) g_tioTx += (char)val;
+    }
     if (a == 0x20 + 0x3F) {
         g_f.I=(val>>7)&1; g_f.T=(val>>6)&1; g_f.H=(val>>5)&1; g_f.S=(val>>4)&1;
         g_f.V=(val>>3)&1; g_f.N=(val>>2)&1; g_f.Z=(val>>1)&1; g_f.C=val&1;
         return;
     }
-    if (a == 0x20 + 0x1C && !g_eeprom.empty()) {   // EECR: EERIE(3) EEMWE(2) EEWE(1) EERE(0)
-        uint16_t ea = (uint16_t)((g_dmem[0x3E] | ((g_dmem[0x3F] & 0xFF) << 8)) % g_eeprom.size());
+    if (a == g_eeCR && !g_eeprom.empty() && g_eeARL >= 0 && g_eeARL < (int)DMEM_SIZE
+        && g_eeDR >= 0 && g_eeDR < (int)DMEM_SIZE) {   // EECR/I адреса берём из профиля
+        uint16_t ea = (uint16_t)g_dmem[g_eeARL];
+        if (g_eeARH >= 0) ea |= (uint16_t)(g_dmem[g_eeARH] << 8);
+        ea = (uint16_t)(ea % g_eeprom.size());
         if (val & 0x02) {                          // EEWE=1: commit EEDR into EEPROM cell
-            g_eeprom[ea] = g_dmem[0x3D];
+            g_eeprom[ea] = g_dmem[g_eeDR];
             val &= ~0x02;                          // write completes instantly -> EEWE cleared
         }
         if (val & 0x01) {                          // EERE=1: load EEDR from cell
-            g_dmem[0x3D] = g_eeprom[ea];
+            g_dmem[g_eeDR] = g_eeprom[ea];
             val &= ~0x01;                          // read done -> EERE cleared
         }
         g_dmem[a] = (uint8_t)val;
@@ -1424,6 +1462,14 @@ static bool dispatchPending() {
         if (!((en >> e[i].enBit) & 1)) continue;
         list.push_back({ vi->second, e[i].vec, true, flagIO, e[i].flagBit });
     }
+    // USART приём (Terminal I/O): RXC=1 и RXCIE=1 -> ISR USART RX (как в AVR Studio)
+    if (g_udr >= 0 && g_ucsrA >= 0 && g_ucsrB >= 0 && g_udr < (int)DMEM_SIZE) {
+        static const char* cn[4] = { "usart_rx_vect", "usart_rxc_vect", "usart0_rx_vect", "usart0_rxc_vect" };
+        auto vi = g_isrv.end();
+        for (int k = 0; k < 4 && vi == g_isrv.end(); k++) vi = g_isrv.find(cn[k]);
+        if (vi != g_isrv.end() && (readDmem(g_ucsrA) >> 7) && (readDmem(g_ucsrB) >> 7))
+            list.push_back({ vi->second, vi->first, true, g_ucsrA, 7 });
+    }
     for (int t = 0; t < 3; t++) {
         if (!g_ts[t].have) continue;
         const char* names[2] = { t == 0 ? "timer0_ovf_vect" : t == 1 ? "timer1_ovf_vect" : "timer2_ovf_vect",
@@ -1950,6 +1996,92 @@ static bool dispatch(const std::string& line) {
         }
         return true;
     }
+    if (cmd == "uart" || cmd == "tio") {
+        // Terminal I/O (как окно Terminal I/O в AVR Studio)
+        std::string s1 = lower(a(1));
+        if (g_udr < 0 && (s1 == "push" || s1 == "send")) { wr(" В профиле нет USART (UDR) — Terminal I/O недоступен", RED); return true; }
+        if (s1 == "push" || s1 == "send") {
+            std::string txt;
+            for (int q = 2; !a(q).empty(); q++) { if (!txt.empty()) txt += ' '; txt += a(q); }
+            if (txt.empty()) { wr(" формат: uart push <текст> — приём байтов (Terminal I/O)", RED); return true; }
+            for (size_t q = 0; q < txt.size(); q++) {
+                if (q == 0) g_dmem[g_udr] = (uint8_t)txt[0];
+                else        g_tioRx.push_back((uint8_t)txt[q]);
+            }
+            if (g_ucsrA >= 0) g_dmem[g_ucsrA] |= 0x80;          // RXC
+            wr(fmt(" RX: %u байт(а) в очередь USART (UDR + RXC)", (unsigned)txt.size()), GREEN);
+            return true;
+        }
+        if (s1 == "clear") { g_tioTx.clear(); wr(" TX-лог очищен", GREEN); return true; }
+        wr(" Terminal I/O (USART):", CYAN);
+        if (g_tioTx.empty()) wr("  TX: (пусто — записи в UDR попадают сюда)");
+        else {
+            for (size_t off = 0; off < g_tioTx.size(); off += 64) {
+                std::string l = "  TX: ";
+                size_t e = (std::min)(off + 64, g_tioTx.size());
+                for (size_t q = off; q < e; q++) {
+                    unsigned char c = (unsigned char)g_tioTx[q];
+                    l += (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+                }
+                wr(l);
+            }
+        }
+        if (g_udr < 0) {
+            wr("  RX: USART отсутствует в профиле", DGRAY);
+            return true;
+        }
+        wr(fmt("  RX: в UDR=0x%02X RXC=%d, в очереди %u",
+               g_dmem[g_udr], (readDmem(g_ucsrA) >> 7) & 1, (unsigned)g_tioRx.size()), DGRAY);
+        return true;
+    }
+    if (cmd == "iotree" || cmd == "ot") {
+        // I/O window: регистры профиля, сгруппированные по модулям периферии
+        struct Grp { const char* nm; const char* pfx[9]; };
+        static const Grp G[8] = {
+            { "GPIO",    { "ddr", "port", "pin", "pinctrl", "vport", "gpio", "tcb_", 0, 0 } },
+            { "TIMER",   { "tcnt", "tccr", "tifr", "timsk", "ocr", "icr", "dtimsk", "hires", "awex" } },
+            { "USART",   { "usart", "ucs", "ubrr", "udr", 0, 0, 0, 0, 0 } },
+            { "SPI",     { "spc", "sps", "spd", "spis", 0, 0, 0, 0, 0 } },
+            { "ADC",     { "adc", "admux", "didr", 0, 0, 0, 0, 0, 0 } },
+            { "AC",      { "acs", "acsr", 0, 0, 0, 0, 0, 0, 0 } },
+            { "TWI",     { "tw", 0, 0, 0, 0, 0, 0, 0, 0 } },
+            { "EEPROM",  { "ee", 0, 0, 0, 0, 0, 0, 0, 0 } }
+        };
+        std::vector<std::string> bks[9];
+        for (auto& kv : g_regmap) {
+            std::string n = kv.first;
+            int g = -1;
+            // CPU-блок: точные имена + WDT/GPIOR
+            if (n == "sreg" || n == "sph" || n == "spl" || n == "spmcr" || n == "spmcsr" ||
+                n == "smcr" || n == "mcucr" || n == "mcucsr" || n == "mcusr" ||
+                n.compare(0, 3, "wdt") == 0 || n.compare(0, 5, "gpior") == 0) g = 8;
+            else {
+                for (int gi = 0; gi < 8 && g < 0; gi++)
+                    for (int q = 0; q < 9 && g < 0; q++) {
+                        const char* px = G[gi].pfx[q];
+                        if (!px) break;
+                        if (n.size() >= strlen(px) && n.compare(0, strlen(px), px) == 0) g = gi;
+                    }
+            }
+            bks[g >= 0 ? g : 8].push_back(n);
+        }
+        std::string flt = lower(a(1));
+        wr(" I/O window (карта профиля):", CYAN);
+        for (int gi = 0; gi < 9; gi++) {
+            std::string gnm = (gi < 8) ? G[gi].nm : "CPU/WDT/прочее";
+            if (bks[gi].empty()) continue;
+            if (flt.empty()) wr(fmt(" [%s]", gnm.c_str()), YELLOW);
+            for (auto& n : bks[gi]) {
+                if (!flt.empty() && n.find(flt) == std::string::npos) continue;
+                int s = g_regmap[n];
+                if (s - 0x20 >= 0 && s - 0x20 <= 0x3F)
+                    wr(fmt("   %-14s IO 0x%02X  0x%02X", upper(n).c_str(), s - 0x20, readDmem(s)));
+                else
+                    wr(fmt("   %-14s SR 0x%04X 0x%02X", upper(n).c_str(), s, readDmem(s)));
+            }
+        }
+        return true;
+    }
     if (cmd == "auto" || cmd == "au") {
         int n = a(1).empty() ? 2 : atoi(a(1).c_str());
         int dms = a(2).empty() ? 500 : atoi(a(2).c_str());
@@ -2035,6 +2167,7 @@ static bool dispatch(const std::string& line) {
         wr("  mem sram|flash <addr> [len]        - dump; write: mem sram 0x60 = 0xFF");
         wr("  bp add|ba <addr|sym|vect>  list|bl  del|bd <n|all>");
         wr("  isr (int status)   w <var|addr> (watch)   tr (timer reset)   sz size   da (disasm)");
+        wr("  iotree (ot) [filter] - window I/O by modules;  uart push|clear (tio) - \"screen\" Terminal I/O");
         wr("  selftest | selftest2 | quiet | quit(q)");
         return true;
     }
@@ -2069,7 +2202,7 @@ int main(int argc, char** argv) {
 
     wr("================================================================================");
     wr(fmt("  AVR CLI Studio (C++)  |  Core: %s  |  F_CPU = %u Hz", g_chip.c_str(), g_fcpu), CYAN);
-    wr("  Type 'help' for commands.                                      (emu.cpp v0.3)", DCYAN);
+    wr("  Type 'help' for commands.                                      (emu.cpp v1.0)", DCYAN);
     wr("================================================================================");
 
     if (!runScript.empty()) {
