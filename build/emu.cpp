@@ -1139,6 +1139,8 @@ static void renderDash() {
     wr(fmt(" [CHIP: %s]  [F_CPU: %.1f MHz]  [STATUS: %s]", g_chip.c_str(), g_fcpu/1e6, st), CYAN);
     wr(fmt(" [PC: 0x%04X]  [SP: 0x%04X]  [CYCLES: %llu]  [TIME: %.2f us]", g_pc, sp,
           (unsigned long long)g_cycles, tu), CYAN);
+    wr(fmt(" [X: 0x%04X]  [Y: 0x%04X]  [Z: 0x%04X]  (указатели R26..R31)",
+          g_dmem[0x1A] | (g_dmem[0x1B] << 8), g_dmem[0x1C] | (g_dmem[0x1D] << 8), g_dmem[0x1E] | (g_dmem[0x1F] << 8)), CYAN);
     wr("--------------------------------------------------------------------------------", DCYAN);
     { std::string s = " SREG:";
       const char* nm[8] = {"I","T","H","S","V","N","Z","C"};
@@ -1869,6 +1871,85 @@ static bool dispatch(const std::string& line) {
         }
         return true;
     }
+    if (cmd == "stk" || cmd == "stack") {
+        uint16_t sp = g_dmem[0x5D] | (g_dmem[0x5E] << 8);
+        wr(fmt(" SP=0x%04X, RAM_END=0x%04X, стек растёт вверх:", sp, RAM_END), CYAN);
+        int n = 0;
+        for (long a0 = sp + 1; a0 + 1 <= RAM_END && n < 8; a0 += 2, n++) {
+            uint16_t w = readDmem((int)a0) | (readDmem((int)a0 + 1) << 8);
+            wr(fmt("  [0x%04X] 0x%04X%s", (int)a0, w, (n == 0) ? "   <- вершина" : ""));
+        }
+        if (n == 0) wr("  (стек пуст)");
+        return true;
+    }
+    if (cmd == "regs" || cmd == "regm") {
+        // карта регистров текущего профиля [RegisterMap] с фильтром по имени
+        std::string flt = lower(a(1));
+        int shown = 0;
+        for (auto& kv : g_regmap) {
+            if (!flt.empty() && kv.first.find(flt) == std::string::npos) continue;
+            int s = kv.second; int io = s - 0x20;
+            if (io >= 0 && io <= 0x3F) wr(fmt("  %-14s IO 0x%02X / SRAM 0x%04X", upper(kv.first).c_str(), io, s));
+            else                       wr(fmt("  %-14s SRAM 0x%04X (extended)", upper(kv.first).c_str(), s));
+            shown++;
+        }
+        wr(fmt("  найдено: %d.  подробнее: io <REG>", shown), DGRAY);
+        return true;
+    }
+    if (cmd == "io" || cmd == "iov") {
+        // I/O-view побитно, как I/O window в AVR Studio (берём адрес из профиля)
+        std::string rn = upper(a(1));
+        if (rn.empty()) { wr(" формат: io <REG> (io SREG / io TIMSK); список: regs [фильтр]", YELLOW); return true; }
+        auto it = g_regmap.find(lower(rn));
+        if (it == g_regmap.end()) { wr(" Регистр " + rn + " не найден в профиле [RegisterMap]", RED); return true; }
+        int s = it->second; int ioA = s - 0x20;
+        uint8_t v = (uint8_t)readDmem(s);
+        char bin[9]; for (int b = 0; b < 8; b++) bin[b] = ((v >> (7 - b)) & 1) ? '1' : '0'; bin[8] = 0;
+        std::string ios = (ioA >= 0 && ioA <= 0x3F) ? fmt("  IO 0x%02X", ioA) : "";
+        wr(fmt(" %s @ SRAM 0x%04X%s = 0x%02X  0b%s", rn.c_str(), s, ios.c_str(), v, bin), CYAN);
+        static const struct { const char* nm; const char* bl[8]; } bt[] = {
+            { "SREG",   { "I", "T", "H", "S", "V", "N", "Z", "C" } },
+            { "MCUSR",  { "", "", "", "", "WDRF", "BORF", "EXTRF", "PORF" } },
+            { "MCUCSR", { "JTD", "", "", "", "WDRF", "BORF", "EXTRF", "PORF" } },
+            { "SPMCSR", { "SPMIE", "RWWSB", "", "RWWSRE", "BLBSET", "PGWRT", "PGERS", "SPMEN" } },
+            { "SPMCR",  { "SPMIE", "RWWSB", "", "RWWSRE", "BLBSET", "PGWRT", "PGERS", "SPMEN" } },
+            { "ADCSRA", { "ADEN", "ADSC", "ADATE", "ADIF", "ADIE", "ADPS2", "ADPS1", "ADPS0" } },
+            { "ADMUX",  { "REFS1", "REFS0", "ADLAR", "", "MUX3", "MUX2", "MUX1", "MUX0" } },
+            { "UCSRA",  { "RXC", "TXC", "UDRE", "FE", "DOR", "UPE", "U2X", "MPCM" } },
+            { "UCSRB",  { "RXCIE", "TXCIE", "UDRIE", "RXEN", "TXEN", "UCSZ2", "RXB8", "TXB8" } },
+            { "UCSRC",  { "URSEL", "UMSEL", "UPM1", "UPM0", "USBS", "UCSZ1", "UCSZ0", "UCPOL" } },
+            { "SPCR",   { "SPIE", "SPE", "DORD", "MSTR", "CPOL", "CPHA", "SPR1", "SPR0" } },
+            { "SPSR",   { "SPIF", "WCOL", "", "", "", "", "", "SPI2X" } },
+            { "TWSR",   { "TWS7", "TWS6", "TWS5", "TWS4", "TWS3", "", "TWPS1", "TWPS0" } },
+            { "TCCR1A", { "COM1A1", "COM1A0", "COM1B1", "COM1B0", "", "WGM11", "WGM10", "" } },
+            { "TCCR1B", { "ICNC1", "ICES1", "", "WGM13", "WGM12", "CS12", "CS11", "CS10" } },
+            { "SMCR",   { "", "", "", "", "SE", "SM2", "SM1", "SM0" } },
+            { "WDTCR",  { "", "", "", "WDCE", "WDE", "WDP2", "WDP1", "WDP0" } },
+            { "ASSR",   { "", "", "", "", "AS2", "TCN2UB", "OCR2UB", "TCR2UB" } }
+        };
+        const char* bl[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        for (auto& row : bt) {
+            if (lower(row.nm) == lower(rn)) { for (int i = 0; i < 8; i++) bl[i] = row.bl[i]; break; }
+        }
+        int named = 0;
+        for (int i = 0; i < 8; i++) if (bl[i] && bl[i][0]) named++;
+        if (named >= 2) {
+            std::string l1 = "  ", l2 = "  ";
+            for (int i = 0; i < 8; i++) {
+                if (bl[i] && bl[i][0]) l1 += fmt("%-6s", bl[i]);
+                else                   l1 += fmt("%-6s", fmt("b%d", 7 - i).c_str());
+                l2 += fmt("%-6s", fmt("%d", (v >> (7 - i)) & 1).c_str());
+            }
+            wr(l1, DGRAY);
+            wr(l2, GRAY);
+        } else {
+            std::string l = "  установлены биты:";
+            bool any = false;
+            for (int i = 0; i < 8; i++) if ((v >> (7 - i)) & 1) { l += fmt(" %d", 7 - i); any = true; }
+            wr(any ? l : "  все нули", GRAY);
+        }
+        return true;
+    }
     if (cmd == "auto" || cmd == "au") {
         int n = a(1).empty() ? 2 : atoi(a(1).c_str());
         int dms = a(2).empty() ? 500 : atoi(a(2).c_str());
@@ -1946,6 +2027,9 @@ static bool dispatch(const std::string& line) {
         wr("  stepi(si) [n] | step(s) [n] | next(n) [n]   - step instructions / over calls");
         wr("  finish(fin) | until(u) <addr|sym>  - run-to-return / run-to-target");
         wr("  reg R# [= val] | sreg | all        - read/assign registers");
+        wr("  io <REG>                           - bit-level view of the register (io TIMSK)");
+        wr("  regs [filter]                      - register map of the profile [RegisterMap]");
+        wr("  stk (stack)                        - stack content from SP upward");
         wr("  port <A|B|C|D>                     - port pins report (IN/OUT/PullUp)");
         wr("  pin <P#|P#bit> <v|toggle>          - stimulus");
         wr("  mem sram|flash <addr> [len]        - dump; write: mem sram 0x60 = 0xFF");
@@ -1985,7 +2069,7 @@ int main(int argc, char** argv) {
 
     wr("================================================================================");
     wr(fmt("  AVR CLI Studio (C++)  |  Core: %s  |  F_CPU = %u Hz", g_chip.c_str(), g_fcpu), CYAN);
-    wr("  Type 'help' for commands.                                      (emu.cpp v0.2)", DCYAN);
+    wr("  Type 'help' for commands.                                      (emu.cpp v0.3)", DCYAN);
     wr("================================================================================");
 
     if (!runScript.empty()) {
