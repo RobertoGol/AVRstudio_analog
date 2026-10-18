@@ -1,0 +1,112 @@
+# AVR CLI Studio processor profile - AUTOGEN from io2333.h (tools/genprocs.ps1)
+# Источник: заголовок тулчейна avr-gcc. Ручные правки потеряются при -Overwrite.
+
+[Identity]
+Name = AT90S2333
+MCU_Target = at90s2333
+Define_Tag = __AVR_AT90S2333__
+Default_F_CPU = 1000000
+
+[Signature]
+Signature = 0x00 0x00 0x00   # device id (SPM BLBSET / avrdude)
+
+[Memory]
+  FlashEnd = 0x07FF            # последний байт Flash (2 КБ)
+  SRAMStart = 0x0060            # начало ОЗУ данных
+  RamEnd = 0x00DF            # вершина стека SP
+  EepromEnd = 0x007F
+
+[Ports]
+  B = 0x16 0x17 0x18
+  C = 0x13 0x14 0x15
+  D = 0x10 0x11 0x12
+
+[Interrupts]
+1 = SIG_INTERRUPT0
+1 = INT0_vect
+2 = SIG_INTERRUPT1
+2 = INT1_vect
+3 = SIG_INPUT_CAPTURE1
+3 = TIMER1_CAPT_vect
+4 = SIG_OUTPUT_COMPARE1A
+4 = TIMER1_COMP_vect
+5 = SIG_OVERFLOW1
+5 = TIMER1_OVF_vect
+6 = SIG_OVERFLOW0
+6 = TIMER0_OVF_vect
+7 = SIG_SPI
+7 = SPI_STC_vect
+8 = SIG_UART_RECV
+8 = UART_RX_vect
+9 = SIG_UART_DATA
+9 = UART_UDRE_vect
+10 = SIG_UART_TRANS
+10 = UART_TX_vect
+11 = SIG_ADC
+11 = ADC_vect
+12 = SIG_EEPROM_READY
+12 = EE_RDY_vect
+13 = SIG_COMPARATOR
+13 = ANA_COMP_vect
+
+[RegisterMap]
+UBRRH|IO8|0x03
+ADCL|IO8|0x04
+ADCH|IO8|0x05
+ADCSR|IO8|0x06
+ADMUX|IO8|0x07
+ACSR|IO8|0x08
+UBRR|IO8|0x09
+UCSRB|IO8|0x0A
+UCSRA|IO8|0x0B
+UDR|IO8|0x0C
+SPCR|IO8|0x0D
+SPSR|IO8|0x0E
+SPDR|IO8|0x0F
+PIND|IO8|0x10
+DDRD|IO8|0x11
+PORTD|IO8|0x12
+PINC|IO8|0x13
+DDRC|IO8|0x14
+PORTC|IO8|0x15
+PINB|IO8|0x16
+DDRB|IO8|0x17
+PORTB|IO8|0x18
+EECR|IO8|0x1C
+EEDR|IO8|0x1D
+EEAR|IO8|0x1E
+EEARL|IO8|0x1E
+WDTCR|IO8|0x21
+ICR1L|IO8|0x26
+ICR1H|IO8|0x27
+OCR1L|IO8|0x2A
+OCR1H|IO8|0x2B
+TCNT1L|IO8|0x2C
+TCNT1H|IO8|0x2D
+TCCR1B|IO8|0x2E
+TCCR1A|IO8|0x2F
+TCNT0|IO8|0x32
+TCCR0|IO8|0x33
+MCUSR|IO8|0x34
+MCUCR|IO8|0x35
+TIFR|IO8|0x38
+TIMSK|IO8|0x39
+GIFR|IO8|0x3A
+GIMSK|IO8|0x3B
+
+[Cycles]
+# Instruction clocks (avr4 core)
+LDI/MOV/MOVW/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SER/BST/BLD/BSET/BCLR = 1
+LSL/LSR/ROL/ROR/ASR = 1
+MUL/MULS/MULSU/FMUL = 2
+ADIW/SBIW/LDS/STS/LD/ST/LPM/IN/OUT/PUSH/POP/SBI/CBI/SBRC/SBRS/SBIC/SBIS/SEC (SE/CL aliases)/CP/SUBI variants = 1-2
+RJMP/RCALL (not taken) branch/IJMP/ICALL/JMP = 2
+Branch taken = 2 ; not taken = 1
+RCALL = 3 ; RET/RETI/JMP/CALL = 4
+StopWatch: Time_us = Cycles * 1000000 / F_CPU
+
+[GPIO rules]
+# DDRx=1 -> output: PIN reads PORT latch (or stimulus level if external)
+# DDRx=0 & PORTx=1 -> input with pull-up: PIN reads 1 unless external stimulus is 0
+# DDRx=0 & PORTx=0 -> Hi-Z: floating, PIN reads external stimulus
+# Writing 1 to PINx bit (with DDRx=1) toggles PORTx latch

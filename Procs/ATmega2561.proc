@@ -1,0 +1,38 @@
+# AVR CLI Studio processor profile - AUTOGEN from iom2561.h (tools/genprocs.ps1)
+# Источник: заголовок тулчейна avr-gcc. Ручные правки потеряются при -Overwrite.
+
+[Identity]
+Name = ATmega2561
+MCU_Target = atmega2561
+Define_Tag = __AVR_ATmega2561__
+Default_F_CPU = 1000000
+
+[Signature]
+Signature = 0x1E 0x98 0x02   # device id (SPM BLBSET / avrdude)
+
+[Memory]
+  FlashEnd = 0x3FFFF            # последний байт Flash (256 КБ)
+  SRAMStart = 0x0060            # начало ОЗУ данных
+  RamEnd = 0x21FF            # вершина стека SP
+  EepromEnd = 0x0FFF
+  SpmPagesize = 256
+
+[Ports]
+# порты вне I/O-пространства (расширенные или отсутствуют)
+
+[Cycles]
+# Instruction clocks (avr4 core)
+LDI/MOV/MOVW/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SER/BST/BLD/BSET/BCLR = 1
+LSL/LSR/ROL/ROR/ASR = 1
+MUL/MULS/MULSU/FMUL = 2
+ADIW/SBIW/LDS/STS/LD/ST/LPM/IN/OUT/PUSH/POP/SBI/CBI/SBRC/SBRS/SBIC/SBIS/SEC (SE/CL aliases)/CP/SUBI variants = 1-2
+RJMP/RCALL (not taken) branch/IJMP/ICALL/JMP = 2
+Branch taken = 2 ; not taken = 1
+RCALL = 3 ; RET/RETI/JMP/CALL = 4
+StopWatch: Time_us = Cycles * 1000000 / F_CPU
+
+[GPIO rules]
+# DDRx=1 -> output: PIN reads PORT latch (or stimulus level if external)
+# DDRx=0 & PORTx=1 -> input with pull-up: PIN reads 1 unless external stimulus is 0
+# DDRx=0 & PORTx=0 -> Hi-Z: floating, PIN reads external stimulus
+# Writing 1 to PINx bit (with DDRx=1) toggles PORTx latch

@@ -1,0 +1,67 @@
+# AVR CLI Studio processor profile - AUTOGEN from iotn28.h (tools/genprocs.ps1)
+# Источник: заголовок тулчейна avr-gcc. Ручные правки потеряются при -Overwrite.
+
+[Identity]
+Name = ATtiny28
+MCU_Target = attiny28
+Define_Tag = __AVR_ATtiny28__
+Default_F_CPU = 1000000
+
+[Signature]
+Signature = 0x1E 0x91 0x07   # device id (SPM BLBSET / avrdude)
+
+[Memory]
+  FlashEnd = 0x07FF            # последний байт Flash (2 КБ)
+  SRAMStart = 0x0060            # начало ОЗУ данных
+  RamEnd = 0x001F            # вершина стека SP
+  EepromEnd = 0x0000
+
+[Ports]
+  D = 0x10 0x11 0x12
+
+[Interrupts]
+1 = SIG_INTERRUPT0
+1 = INT0_vect
+2 = SIG_INTERRUPT1
+2 = INT1_vect
+3 = SIG_PIN
+3 = LOWLEVEL_IO_PINS_vect
+4 = SIG_OVERFLOW0
+4 = TIMER0_OVF_vect
+5 = SIG_COMPARATOR
+5 = ANA_COMP_vect
+
+[RegisterMap]
+OSCCAL|IO8|0x00
+WDTCR|IO8|0x01
+MODCR|IO8|0x02
+TCNT0|IO8|0x03
+TCCR0|IO8|0x04
+IFR|IO8|0x05
+ICR|IO8|0x06
+MCUCS|IO8|0x07
+ACSR|IO8|0x08
+PIND|IO8|0x10
+DDRD|IO8|0x11
+PORTD|IO8|0x12
+PINB|IO8|0x16
+PINA|IO8|0x19
+PACR|IO8|0x1A
+PORTA|IO8|0x1B
+
+[Cycles]
+# Instruction clocks (avr4 core)
+LDI/MOV/MOVW/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SER/BST/BLD/BSET/BCLR = 1
+LSL/LSR/ROL/ROR/ASR = 1
+MUL/MULS/MULSU/FMUL = 2
+ADIW/SBIW/LDS/STS/LD/ST/LPM/IN/OUT/PUSH/POP/SBI/CBI/SBRC/SBRS/SBIC/SBIS/SEC (SE/CL aliases)/CP/SUBI variants = 1-2
+RJMP/RCALL (not taken) branch/IJMP/ICALL/JMP = 2
+Branch taken = 2 ; not taken = 1
+RCALL = 3 ; RET/RETI/JMP/CALL = 4
+StopWatch: Time_us = Cycles * 1000000 / F_CPU
+
+[GPIO rules]
+# DDRx=1 -> output: PIN reads PORT latch (or stimulus level if external)
+# DDRx=0 & PORTx=1 -> input with pull-up: PIN reads 1 unless external stimulus is 0
+# DDRx=0 & PORTx=0 -> Hi-Z: floating, PIN reads external stimulus
+# Writing 1 to PINx bit (with DDRx=1) toggles PORTx latch

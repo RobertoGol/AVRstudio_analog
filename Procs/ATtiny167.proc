@@ -1,0 +1,145 @@
+# AVR CLI Studio processor profile - AUTOGEN from iotn167.h (tools/genprocs.ps1)
+# Источник: заголовок тулчейна avr-gcc. Ручные правки потеряются при -Overwrite.
+
+[Identity]
+Name = ATtiny167
+MCU_Target = attiny167
+Define_Tag = __AVR_ATtiny167__
+Default_F_CPU = 1000000
+
+[Signature]
+Signature = 0x1E 0x94 0x87   # device id (SPM BLBSET / avrdude)
+
+[Memory]
+  FlashEnd = 0x3FFF            # последний байт Flash (16 КБ)
+  SRAMStart = 0x0060            # начало ОЗУ данных
+  RamEnd = 0x02FE            # вершина стека SP
+  EepromEnd = 0x01FF
+  SpmPagesize = 128
+
+[Ports]
+  A = 0x00 0x01 0x02
+  B = 0x03 0x04 0x05
+
+[Interrupts]
+1 = INT0_vect
+2 = INT1_vect
+3 = PCINT0_vect
+4 = PCINT1_vect
+5 = WDT_vect
+6 = TIMER1_CAPT_vect
+7 = TIMER1_COMPA_vect
+8 = TIMER1_COMPB_vect
+9 = TIMER1_OVF_vect
+10 = TIMER0_COMPA_vect
+11 = TIMER0_OVF_vect
+12 = LIN_TC_vect
+13 = LIN_ERR_vect
+14 = SPI_STC_vect
+15 = ADC_vect
+16 = EE_RDY_vect
+17 = ANA_COMP_vect
+18 = USI_START_vect
+19 = USI_OVF_vect
+
+[RegisterMap]
+PINA|IO8|0x00
+DDRA|IO8|0x01
+PORTA|IO8|0x02
+PINB|IO8|0x03
+DDRB|IO8|0x04
+PORTB|IO8|0x05
+PORTCR|IO8|0x12
+TIFR0|IO8|0x15
+TIFR1|IO8|0x16
+PCIFR|IO8|0x1B
+EIFR|IO8|0x1C
+EIMSK|IO8|0x1D
+GPIOR0|IO8|0x1E
+EECR|IO8|0x1F
+EEDR|IO8|0x20
+EEARL|IO8|0x21
+EEARH|IO8|0x22
+GTCCR|IO8|0x23
+TCCR0A|IO8|0x25
+TCCR0B|IO8|0x26
+TCNT0|IO8|0x27
+OCR0A|IO8|0x28
+GPIOR1|IO8|0x2A
+GPIOR2|IO8|0x2B
+SPCR|IO8|0x2C
+SPSR|IO8|0x2D
+SPDR|IO8|0x2E
+ACSR|IO8|0x30
+DWDR|IO8|0x31
+SMCR|IO8|0x33
+MCUSR|IO8|0x34
+MCUCR|IO8|0x35
+SPMCSR|IO8|0x37
+WDTCR|MEM8|0x60
+CLKPR|MEM8|0x61
+CLKCSR|MEM8|0x62
+CLKSELR|MEM8|0x63
+PRR|MEM8|0x64
+OSCCAL|MEM8|0x66
+PCICR|MEM8|0x68
+EICRA|MEM8|0x69
+PCMSK0|MEM8|0x6B
+PCMSK1|MEM8|0x6C
+TIMSK0|MEM8|0x6E
+TIMSK1|MEM8|0x6F
+AMISCR|MEM8|0x77
+ADCL|MEM8|0x78
+ADCH|MEM8|0x79
+ADCSRA|MEM8|0x7A
+ADCSRB|MEM8|0x7B
+ADMUX|MEM8|0x7C
+DIDR0|MEM8|0x7E
+DIDR1|MEM8|0x7F
+TCCR1A|MEM8|0x80
+TCCR1B|MEM8|0x81
+TCCR1C|MEM8|0x82
+TCCR1D|MEM8|0x83
+TCNT1L|MEM8|0x84
+TCNT1H|MEM8|0x85
+ICR1|MEM8|0x86
+ICR1L|MEM8|0x86
+ICR1H|MEM8|0x87
+OCR1AL|MEM8|0x88
+OCR1AH|MEM8|0x89
+OCR1BL|MEM8|0x8A
+OCR1BH|MEM8|0x8B
+ASSR|MEM8|0xB6
+USICR|MEM8|0xB8
+USISR|MEM8|0xB9
+USIDR|MEM8|0xBA
+USIBR|MEM8|0xBB
+USIPP|MEM8|0xBC
+LINCR|MEM8|0xC8
+LINSIR|MEM8|0xC9
+LINENIR|MEM8|0xCA
+LINERR|MEM8|0xCB
+LINBTR|MEM8|0xCC
+LINBRRL|MEM8|0xCD
+LINBRRH|MEM8|0xCE
+LINDLR|MEM8|0xCF
+LINIDR|MEM8|0xD0
+LINSEL|MEM8|0xD1
+LINDAT|MEM8|0xD2
+
+[Cycles]
+# Instruction clocks (avr4 core)
+LDI/MOV/MOVW/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SER/BST/BLD/BSET/BCLR = 1
+LSL/LSR/ROL/ROR/ASR = 1
+MUL/MULS/MULSU/FMUL = 2
+ADIW/SBIW/LDS/STS/LD/ST/LPM/IN/OUT/PUSH/POP/SBI/CBI/SBRC/SBRS/SBIC/SBIS/SEC (SE/CL aliases)/CP/SUBI variants = 1-2
+RJMP/RCALL (not taken) branch/IJMP/ICALL/JMP = 2
+Branch taken = 2 ; not taken = 1
+RCALL = 3 ; RET/RETI/JMP/CALL = 4
+StopWatch: Time_us = Cycles * 1000000 / F_CPU
+
+[GPIO rules]
+# DDRx=1 -> output: PIN reads PORT latch (or stimulus level if external)
+# DDRx=0 & PORTx=1 -> input with pull-up: PIN reads 1 unless external stimulus is 0
+# DDRx=0 & PORTx=0 -> Hi-Z: floating, PIN reads external stimulus
+# Writing 1 to PINx bit (with DDRx=1) toggles PORTx latch

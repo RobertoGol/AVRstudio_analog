@@ -1,0 +1,66 @@
+# AVR CLI Studio processor profile - AUTOGEN from io86r401.h (tools/genprocs.ps1)
+# Источник: заголовок тулчейна avr-gcc. Ручные правки потеряются при -Overwrite.
+
+[Identity]
+Name = AT86RF401
+MCU_Target = at86rf401
+Define_Tag = __AVR_AT86RF401__
+Default_F_CPU = 1000000
+
+[Signature]
+Signature = 0x1E 0x91 0x81   # device id (SPM BLBSET / avrdude)
+
+[Memory]
+  FlashEnd = 0x07FF            # последний байт Flash (2 КБ)
+  SRAMStart = 0x0060            # начало ОЗУ данных
+  RamEnd = 0x00DF            # вершина стека SP
+  EepromEnd = 0x007F
+
+[Ports]
+# порты вне I/O-пространства (расширенные или отсутствуют)
+
+[Interrupts]
+1 = SIG_TXDONE
+1 = TXDONE_vect
+2 = SIG_TXBE
+2 = TXEMPTY_vect
+
+[RegisterMap]
+LOCKDET1|IO8|0x10
+TX_CNTL|IO8|0x12
+PWR_ATTEN|IO8|0x14
+VCOTUNE|IO8|0x16
+LOCKDET2|IO8|0x17
+DEECR|IO8|0x1C
+DEEDR|IO8|0x1D
+DEEAR|IO8|0x1E
+DEEARL|IO8|0x1E
+BTCNT|IO8|0x20
+BTCR|IO8|0x21
+WDTCR|IO8|0x22
+IO_ENAB|IO8|0x30
+IO_DATOUT|IO8|0x31
+IO_DATIN|IO8|0x32
+AVR_CONFIG|IO8|0x33
+B_DET|IO8|0x34
+BL_CONFIG|IO8|0x35
+SPL|IO8|0x3D
+SPH|IO8|0x3E
+SREG|IO8|0x3F
+
+[Cycles]
+# Instruction clocks (avr4 core)
+LDI/MOV/MOVW/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SER/BST/BLD/BSET/BCLR = 1
+LSL/LSR/ROL/ROR/ASR = 1
+MUL/MULS/MULSU/FMUL = 2
+ADIW/SBIW/LDS/STS/LD/ST/LPM/IN/OUT/PUSH/POP/SBI/CBI/SBRC/SBRS/SBIC/SBIS/SEC (SE/CL aliases)/CP/SUBI variants = 1-2
+RJMP/RCALL (not taken) branch/IJMP/ICALL/JMP = 2
+Branch taken = 2 ; not taken = 1
+RCALL = 3 ; RET/RETI/JMP/CALL = 4
+StopWatch: Time_us = Cycles * 1000000 / F_CPU
+
+[GPIO rules]
+# DDRx=1 -> output: PIN reads PORT latch (or stimulus level if external)
+# DDRx=0 & PORTx=1 -> input with pull-up: PIN reads 1 unless external stimulus is 0
+# DDRx=0 & PORTx=0 -> Hi-Z: floating, PIN reads external stimulus
+# Writing 1 to PINx bit (with DDRx=1) toggles PORTx latch

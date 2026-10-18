@@ -1,0 +1,92 @@
+# AVR CLI Studio processor profile - AUTOGEN from io76c711.h (tools/genprocs.ps1)
+# Источник: заголовок тулчейна avr-gcc. Ручные правки потеряются при -Overwrite.
+
+[Identity]
+Name = AT76C711
+MCU_Target = at76c711
+Define_Tag = __AVR_AT76C711__
+Default_F_CPU = 1000000
+
+[Signature]
+Signature = 0x00 0x00 0x00   # device id (SPM BLBSET / avrdude)
+
+[Memory]
+  FlashEnd = 0x3FFF            # последний байт Flash (16 КБ)
+  SRAMStart = 0x0060            # начало ОЗУ данных
+  RamEnd = 0x07FF            # вершина стека SP
+  EepromEnd = 0x0000
+
+[Ports]
+  A = 0x19 0x1a 0x1b
+  B = 0x16 0x17 0x18
+  D = 0x10 0x11 0x12
+
+[Interrupts]
+1 = SIG_SUSPEND_RESUME
+2 = SIG_INTERRUPT0
+3 = SIG_INPUT_CAPTURE1
+4 = SIG_OUTPUT_COMPARE1A
+5 = SIG_OUTPUT_COMPARE1B
+6 = SIG_OVERFLOW1
+7 = SIG_OVERFLOW0
+8 = SIG_SPI
+9 = SIG_TDMAC
+10 = SIG_UART0
+11 = SIG_RDMAC
+12 = SIG_USB_HW
+13 = SIG_UART1
+14 = SIG_INTERRUPT1
+
+[RegisterMap]
+SPCR|IO8|0x0D
+SPSR|IO8|0x0E
+SPDR|IO8|0x0F
+PIND|IO8|0x10
+DDRD|IO8|0x11
+PORTD|IO8|0x12
+PERIPHEN|IO8|0x13
+CLK_CNTR|IO8|0x14
+PORTC|IO8|0x15
+PINB|IO8|0x16
+DDRB|IO8|0x17
+PORTB|IO8|0x18
+PINA|IO8|0x19
+DDRA|IO8|0x1A
+PORTA|IO8|0x1B
+IRDAMOD|IO8|0x20
+WDTCR|IO8|0x21
+ICR1L|IO8|0x26
+ICR1H|IO8|0x27
+OCR1BL|IO8|0x28
+OCR1BH|IO8|0x29
+OCR1AL|IO8|0x2A
+OCR1AH|IO8|0x2B
+TCNT1L|IO8|0x2C
+TCNT1H|IO8|0x2D
+TCCR1B|IO8|0x2E
+TCCR1A|IO8|0x2F
+PRELD|IO8|0x31
+TCNT0|IO8|0x32
+TCCR0|IO8|0x33
+MCUSR|IO8|0x34
+MCUCR|IO8|0x35
+TIFR|IO8|0x36
+TIMSK|IO8|0x37
+EIMSK|IO8|0x39
+
+[Cycles]
+# Instruction clocks (avr4 core)
+LDI/MOV/MOVW/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SER/BST/BLD/BSET/BCLR = 1
+LSL/LSR/ROL/ROR/ASR = 1
+MUL/MULS/MULSU/FMUL = 2
+ADIW/SBIW/LDS/STS/LD/ST/LPM/IN/OUT/PUSH/POP/SBI/CBI/SBRC/SBRS/SBIC/SBIS/SEC (SE/CL aliases)/CP/SUBI variants = 1-2
+RJMP/RCALL (not taken) branch/IJMP/ICALL/JMP = 2
+Branch taken = 2 ; not taken = 1
+RCALL = 3 ; RET/RETI/JMP/CALL = 4
+StopWatch: Time_us = Cycles * 1000000 / F_CPU
+
+[GPIO rules]
+# DDRx=1 -> output: PIN reads PORT latch (or stimulus level if external)
+# DDRx=0 & PORTx=1 -> input with pull-up: PIN reads 1 unless external stimulus is 0
+# DDRx=0 & PORTx=0 -> Hi-Z: floating, PIN reads external stimulus
+# Writing 1 to PINx bit (with DDRx=1) toggles PORTx latch

@@ -1,0 +1,154 @@
+# AVR CLI Studio processor profile - AUTOGEN from ioa6289.h (tools/genprocs.ps1)
+# Источник: заголовок тулчейна avr-gcc. Ручные правки потеряются при -Overwrite.
+
+[Identity]
+Name = ATA6289
+MCU_Target = ata6289
+Define_Tag = __AVR_ATA6289__
+Default_F_CPU = 1000000
+
+[Signature]
+Signature = 0x1E 0x93 0x82   # device id (SPM BLBSET / avrdude)
+
+[Memory]
+  FlashEnd = 0x2000            # последний байт Flash (9 КБ)
+  SRAMStart = 0x0060            # начало ОЗУ данных
+  RamEnd = 0x02FF            # вершина стека SP
+  EepromEnd = 0x0140
+  SpmPagesize = 64
+
+[Ports]
+  B = 0x03 0x04 0x05
+  C = 0x06 0x07 0x08
+  D = 0x09 0x0a 0x0b
+
+[Interrupts]
+1 = INT0_vect
+2 = INT1_vect
+3 = PCINT0_vect
+4 = PCINT1_vect
+5 = PCINT2_vect
+6 = INTVM_vect
+7 = SENINT_vect
+8 = INTT0_vect
+9 = LFWP_vect
+10 = T3CAP_vect
+11 = T3COMA_vect
+12 = T3COMB_vect
+13 = T3OVF_vect
+14 = T2CAP_vect
+15 = T2COM_vect
+16 = T2OVF_vect
+17 = SPISTC_vect
+18 = LFRXB_vect
+19 = INTT1_vect
+20 = T2RXB_vect
+21 = T2TXB_vect
+22 = T2TXC_vect
+23 = LFREOB_vect
+24 = EXCM_vect
+25 = EEREADY_vect
+26 = SPM_RDY_vect
+
+[RegisterMap]
+PINB|IO8|0x03
+DDRB|IO8|0x04
+PORTB|IO8|0x05
+PINC|IO8|0x06
+DDRC|IO8|0x07
+PORTC|IO8|0x08
+PIND|IO8|0x09
+DDRD|IO8|0x0A
+PORTD|IO8|0x0B
+CMCR|IO8|0x0F
+CMSR|IO8|0x10
+T2CRA|IO8|0x11
+T2CRB|IO8|0x12
+T3CRA|IO8|0x14
+VMCSR|IO8|0x16
+PCIFR|IO8|0x17
+LFFR|IO8|0x18
+SSFR|IO8|0x19
+T10IFR|IO8|0x1A
+T2IFR|IO8|0x1B
+T3IFR|IO8|0x1C
+EIFR|IO8|0x1D
+GPIOR0|IO8|0x1E
+EECR|IO8|0x1F
+EEDR|IO8|0x20
+EEARL|IO8|0x21
+EEARH|IO8|0x22
+PCICR|IO8|0x23
+EIMSK|IO8|0x24
+SVCR|IO8|0x27
+SCR|IO8|0x28
+SCCR|IO8|0x29
+GPIOR1|IO8|0x2A
+GPIOR2|IO8|0x2B
+SPCR|IO8|0x2C
+SPSR|IO8|0x2D
+SPDR|IO8|0x2E
+T2MDR|IO8|0x2F
+LFRR|IO8|0x30
+LFCDR|IO8|0x32
+SMCR|IO8|0x33
+MCUSR|IO8|0x34
+MCUCR|IO8|0x35
+LFRB|IO8|0x36
+SPMCSR|IO8|0x37
+T1CR|IO8|0x38
+T0CR|IO8|0x39
+CMIMR|IO8|0x3B
+CLKPR|IO8|0x3C
+WDTCR|MEM8|0x60
+SIMSK|MEM8|0x61
+TSCR|MEM8|0x64
+SRCCAL|MEM8|0x65
+FRCCAL|MEM8|0x66
+MSVCAL|MEM8|0x67
+BGCAL|MEM8|0x68
+EICRA|MEM8|0x69
+PCMSK0|MEM8|0x6A
+PCMSK1|MEM8|0x6B
+PCMSK2|MEM8|0x6C
+T2ICRL|MEM8|0x6E
+T2ICRH|MEM8|0x6F
+T2CORL|MEM8|0x70
+T2CORH|MEM8|0x71
+T2MRA|MEM8|0x72
+T2MRB|MEM8|0x73
+T2IMR|MEM8|0x74
+T3ICRL|MEM8|0x76
+T3ICRH|MEM8|0x77
+T3CORAL|MEM8|0x78
+T3CORAH|MEM8|0x79
+T3CORBL|MEM8|0x7A
+T3CORBH|MEM8|0x7B
+T3MRA|MEM8|0x7C
+T3MRB|MEM8|0x7D
+T3CRB|MEM8|0x7E
+T3IMR|MEM8|0x7F
+LFIMR|MEM8|0x81
+LFRCR|MEM8|0x82
+LFHCR|MEM8|0x83
+LFIDCL|MEM8|0x84
+LFIDCH|MEM8|0x85
+LFCALL|MEM8|0x86
+LFCALH|MEM8|0x87
+
+[Cycles]
+# Instruction clocks (avr4 core)
+LDI/MOV/MOVW/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SER/BST/BLD/BSET/BCLR = 1
+LSL/LSR/ROL/ROR/ASR = 1
+MUL/MULS/MULSU/FMUL = 2
+ADIW/SBIW/LDS/STS/LD/ST/LPM/IN/OUT/PUSH/POP/SBI/CBI/SBRC/SBRS/SBIC/SBIS/SEC (SE/CL aliases)/CP/SUBI variants = 1-2
+RJMP/RCALL (not taken) branch/IJMP/ICALL/JMP = 2
+Branch taken = 2 ; not taken = 1
+RCALL = 3 ; RET/RETI/JMP/CALL = 4
+StopWatch: Time_us = Cycles * 1000000 / F_CPU
+
+[GPIO rules]
+# DDRx=1 -> output: PIN reads PORT latch (or stimulus level if external)
+# DDRx=0 & PORTx=1 -> input with pull-up: PIN reads 1 unless external stimulus is 0
+# DDRx=0 & PORTx=0 -> Hi-Z: floating, PIN reads external stimulus
+# Writing 1 to PINx bit (with DDRx=1) toggles PORTx latch

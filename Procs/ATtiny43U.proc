@@ -1,0 +1,107 @@
+# AVR CLI Studio processor profile - AUTOGEN from iotn43u.h (tools/genprocs.ps1)
+# Источник: заголовок тулчейна avr-gcc. Ручные правки потеряются при -Overwrite.
+
+[Identity]
+Name = ATtiny43U
+MCU_Target = attiny43u
+Define_Tag = __AVR_ATtiny43U__
+Default_F_CPU = 1000000
+
+[Signature]
+Signature = 0x1E 0x92 0x0C   # device id (SPM BLBSET / avrdude)
+
+[Memory]
+  FlashEnd = 0x0FFF            # последний байт Flash (4 КБ)
+  SRAMStart = 0x0060            # начало ОЗУ данных
+  RamEnd = 0x015F            # вершина стека SP
+  EepromEnd = 0x003F
+  SpmPagesize = 64
+
+[Ports]
+  A = 0x19 0x1a 0x1b
+  B = 0x16 0x17 0x18
+
+[Interrupts]
+1 = INT0_vect
+2 = PCINT0_vect
+3 = PCINT1_vect
+4 = WDT_vect
+5 = TIM1_COMPA_vect
+6 = TIM1_COMPB_vect
+7 = TIM1_OVF_vect
+8 = TIM0_COMPA_vect
+9 = TIM0_COMPB_vect
+10 = TIM0_OVF_vect
+11 = ANA_COMP_vect
+12 = ADC_vect
+13 = EE_RDY_vect
+14 = USI_START_vect
+15 = USI_OVF_vect
+
+[RegisterMap]
+PRR|IO8|0x00
+DIDR0|IO8|0x01
+ADCSRB|IO8|0x03
+ADCL|IO8|0x04
+ADCH|IO8|0x05
+ADCSRA|IO8|0x06
+ADMUX|IO8|0x07
+ACSR|IO8|0x08
+TIFR1|IO8|0x0B
+TIMSK1|IO8|0x0C
+USICR|IO8|0x0D
+USISR|IO8|0x0E
+USIDR|IO8|0x0F
+USIBR|IO8|0x10
+PCMSK0|IO8|0x12
+GPIOR0|IO8|0x13
+GPIOR1|IO8|0x14
+GPIOR2|IO8|0x15
+PINB|IO8|0x16
+DDRB|IO8|0x17
+PORTB|IO8|0x18
+PINA|IO8|0x19
+DDRA|IO8|0x1A
+PORTA|IO8|0x1B
+EECR|IO8|0x1C
+EEDR|IO8|0x1D
+EEARL|IO8|0x1E
+PCMSK1|IO8|0x20
+WDTCSR|IO8|0x21
+GTCCR|IO8|0x23
+CLKPR|IO8|0x26
+OCR1B|IO8|0x2B
+OCR1A|IO8|0x2C
+TCNT1|IO8|0x2D
+TCCR1B|IO8|0x2E
+TCCR1A|IO8|0x2F
+TCCR0A|IO8|0x30
+OSCCAL|IO8|0x31
+TCNT0|IO8|0x32
+TCCR0B|IO8|0x33
+MCUSR|IO8|0x34
+MCUCR|IO8|0x35
+OCR0A|IO8|0x36
+SPMCSR|IO8|0x37
+TIFR0|IO8|0x38
+TIMSK0|IO8|0x39
+GIFR|IO8|0x3A
+GIMSK|IO8|0x3B
+OCR0B|IO8|0x3C
+
+[Cycles]
+# Instruction clocks (avr4 core)
+LDI/MOV/MOVW/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SER/BST/BLD/BSET/BCLR = 1
+LSL/LSR/ROL/ROR/ASR = 1
+MUL/MULS/MULSU/FMUL = 2
+ADIW/SBIW/LDS/STS/LD/ST/LPM/IN/OUT/PUSH/POP/SBI/CBI/SBRC/SBRS/SBIC/SBIS/SEC (SE/CL aliases)/CP/SUBI variants = 1-2
+RJMP/RCALL (not taken) branch/IJMP/ICALL/JMP = 2
+Branch taken = 2 ; not taken = 1
+RCALL = 3 ; RET/RETI/JMP/CALL = 4
+StopWatch: Time_us = Cycles * 1000000 / F_CPU
+
+[GPIO rules]
+# DDRx=1 -> output: PIN reads PORT latch (or stimulus level if external)
+# DDRx=0 & PORTx=1 -> input with pull-up: PIN reads 1 unless external stimulus is 0
+# DDRx=0 & PORTx=0 -> Hi-Z: floating, PIN reads external stimulus
+# Writing 1 to PINx bit (with DDRx=1) toggles PORTx latch

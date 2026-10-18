@@ -1,0 +1,85 @@
+# AVR CLI Studio processor profile - AUTOGEN from iotn15.h (tools/genprocs.ps1)
+# Источник: заголовок тулчейна avr-gcc. Ручные правки потеряются при -Overwrite.
+
+[Identity]
+Name = ATtiny15
+MCU_Target = attiny15
+Define_Tag = __AVR_ATtiny15__
+Default_F_CPU = 1000000
+
+[Signature]
+Signature = 0x1E 0x90 0x06   # device id (SPM BLBSET / avrdude)
+
+[Memory]
+  FlashEnd = 0x03FF            # последний байт Flash (1 КБ)
+  SRAMStart = 0x0060            # начало ОЗУ данных
+  RamEnd = 0x001F            # вершина стека SP
+  EepromEnd = 0x003F
+
+[Ports]
+  B = 0x16 0x17 0x18
+
+[Interrupts]
+1 = SIG_INTERRUPT0
+1 = INT0_vect
+2 = SIG_PIN_CHANGE
+2 = SIG_PIN
+2 = IO_PINS_vect
+3 = SIG_OUTPUT_COMPARE1A
+3 = TIMER1_COMP_vect
+4 = SIG_OVERFLOW1
+4 = TIMER1_OVF_vect
+5 = SIG_OVERFLOW0
+5 = TIMER0_OVF_vect
+6 = SIG_EEPROM_READY
+6 = EE_RDY_vect
+7 = SIG_COMPARATOR
+7 = ANA_COMP_vect
+8 = SIG_ADC
+8 = ADC_vect
+
+[RegisterMap]
+ADCL|IO8|0x04
+ADCH|IO8|0x05
+ADCSR|IO8|0x06
+ADMUX|IO8|0x07
+ACSR|IO8|0x08
+PINB|IO8|0x16
+DDRB|IO8|0x17
+PORTB|IO8|0x18
+EECR|IO8|0x1C
+EEDR|IO8|0x1D
+EEAR|IO8|0x1E
+EEARL|IO8|0x1E
+WDTCR|IO8|0x21
+SFIOR|IO8|0x2C
+OCR1B|IO8|0x2D
+OCR1A|IO8|0x2E
+TCNT1|IO8|0x2F
+TCCR1|IO8|0x30
+OSCCAL|IO8|0x31
+TCNT0|IO8|0x32
+TCCR0|IO8|0x33
+MCUSR|IO8|0x34
+MCUCR|IO8|0x35
+TIFR|IO8|0x38
+TIMSK|IO8|0x39
+GIFR|IO8|0x3A
+GIMSK|IO8|0x3B
+
+[Cycles]
+# Instruction clocks (avr4 core)
+LDI/MOV/MOVW/ADD/SUB/AND/OR/EOR/INC/DEC/COM/NEG/SWAP/SER/BST/BLD/BSET/BCLR = 1
+LSL/LSR/ROL/ROR/ASR = 1
+MUL/MULS/MULSU/FMUL = 2
+ADIW/SBIW/LDS/STS/LD/ST/LPM/IN/OUT/PUSH/POP/SBI/CBI/SBRC/SBRS/SBIC/SBIS/SEC (SE/CL aliases)/CP/SUBI variants = 1-2
+RJMP/RCALL (not taken) branch/IJMP/ICALL/JMP = 2
+Branch taken = 2 ; not taken = 1
+RCALL = 3 ; RET/RETI/JMP/CALL = 4
+StopWatch: Time_us = Cycles * 1000000 / F_CPU
+
+[GPIO rules]
+# DDRx=1 -> output: PIN reads PORT latch (or stimulus level if external)
+# DDRx=0 & PORTx=1 -> input with pull-up: PIN reads 1 unless external stimulus is 0
+# DDRx=0 & PORTx=0 -> Hi-Z: floating, PIN reads external stimulus
+# Writing 1 to PINx bit (with DDRx=1) toggles PORTx latch
