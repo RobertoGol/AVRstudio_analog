@@ -183,9 +183,109 @@ static void refreshIoListView() {
     debugStateLine();
 }
 
+// ------------------------------------------------------------ Processor (скрин 16)
+// Отдельное окно ListView Name|Value: PC/SP/X/Y/Z/Cycle/Freq/StopWatch/SREG + R00..R31
+static HWND g_procWin = nullptr, g_procList = nullptr;
+static bool g_procItems = false;      // имена строк уже заполнены
+
+static void procSetItem(int idx, const char* text) {
+    if (!g_procList) return;
+    LVITEMA it = {0};
+    it.mask = LVIF_TEXT; it.iItem = idx; it.iSubItem = 1; it.pszText = (LPSTR)text;
+    SendMessageA(g_procList, LVM_SETITEMTEXTA, idx, (LPARAM)&it);
+}
+
+static LRESULT CALLBACK ProcWinProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_SIZE:
+            if (g_procList) MoveWindow(g_procList, 0, 0, LOWORD(l), HIWORD(l), TRUE);
+            return 0;
+        case WM_CLOSE:
+            ShowWindow(h, SW_HIDE); return 0;   // как в AS4: крестик прячет окно, доступ вернёт View > Processor
+        case WM_DESTROY:
+            g_procWin = g_procList = nullptr; g_procItems = false;
+            return 0;
+    }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static void refreshProcWin() {
+    if (!g_procWin || !g_coreInit) return;
+    char t[64];
+    // X = R26:R27, Y = R28:R29, Z = R30:R31 (регистры_file лежит в SRAM 0..31)
+    uint16_t xv = (uint16_t)(emuapi_readSram(26) | (emuapi_readSram(27) << 8));
+    uint16_t yv = (uint16_t)(emuapi_readSram(28) | (emuapi_readSram(29) << 8));
+    uint16_t zv = (uint16_t)(emuapi_readSram(30) | (emuapi_readSram(31) << 8));
+    unsigned fcpu = emuapi_fcpu();
+    unsigned long long cyc = emuapi_cycles();
+    snprintf(t, sizeof(t), "0x%04X", (unsigned)emuapi_pc());
+    procSetItem(0, t);
+    snprintf(t, sizeof(t), "0x%04X", emuapi_sp());      procSetItem(1, t);
+    snprintf(t, sizeof(t), "0x%04X", xv);               procSetItem(2, t);
+    snprintf(t, sizeof(t), "0x%04X", yv);               procSetItem(3, t);
+    snprintf(t, sizeof(t), "0x%04X", zv);               procSetItem(4, t);
+    snprintf(t, sizeof(t), "%llu", cyc);                procSetItem(5, t);
+    snprintf(t, sizeof(t), "%.3f MHz", fcpu / 1000000.0); procSetItem(6, t);
+    snprintf(t, sizeof(t), "%.3f ms", cyc * 1000.0 / (fcpu ? fcpu : 1)); procSetItem(7, t);
+    snprintf(t, sizeof(t), "0x%02X", emuapi_sreg());    procSetItem(8, t);
+    for (unsigned r = 0; r < 32; r++) {
+        snprintf(t, sizeof(t), "0x%02X", emuapi_readSram((int)r));
+        procSetItem(10 + (int)r, t);
+    }
+}
+
+static void addProcRowsOnce(HWND list) {
+    static const char* kNames[10] = {
+        "Program Counter", "Stack Pointer", "X pointer", "Y pointer", "Z pointer",
+        "Cycle Counter", "Frequency", "Stop Watch", "SREG", "Registers"
+    };
+    char n[8];
+    for (int i = 0; i < 10; i++) {
+        LVITEMA it = {0};
+        it.mask = LVIF_TEXT; it.iItem = i; it.pszText = (LPSTR)kNames[i];
+        SendMessageA(list, LVM_INSERTITEMA, i, (LPARAM)&it);
+    }
+    for (unsigned r = 0; r < 32; r++) {
+        snprintf(n, sizeof(n), "R%02u", r);
+        LVITEMA it = {0};
+        it.mask = LVIF_TEXT; it.iItem = 10 + (int)r; it.pszText = n;
+        SendMessageA(list, LVM_INSERTITEMA, 10 + (int)r, (LPARAM)&it);
+    }
+}
+
+// Показ окна Processor (View > Processor). Возвращает true, если окно открыто/стало видимым.
+static bool showProcWin(HWND parent) {
+    if (!parent) parent = g_main;
+    if (g_procWin) { ShowWindow(g_procWin, SW_SHOW); SetForegroundWindow(g_procWin); refreshProcWin(); return true; }
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = ProcWinProc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = "AVRCLI_ProcWin";
+    wc.hCursor = LoadCursorA(nullptr, (LPCSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassA(&wc);
+    g_procWin = CreateWindowExA(WS_EX_TOOLWINDOW, "AVRCLI_ProcWin", "Processor",
+        WS_POPUP | WS_CAPTION | WS_SIZEBOX | WS_SYSMENU, 800, 200, 320, 560,
+        parent, nullptr, GetModuleHandleA(nullptr), nullptr);
+    g_procList = CreateWindowExA(0, WC_LISTVIEWA, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
+                                 0, 0, 316, 530, g_procWin, (HMENU)(intptr_t)1, GetModuleHandleA(nullptr), nullptr);
+    SendMessageA(g_procList, WM_SETFONT, (WPARAM)g_fontUi, TRUE);
+    LVCOLUMNA col = {0};
+    col.mask = LVCF_TEXT | LVCF_WIDTH;
+    col.cx = 150; col.pszText = (LPSTR)"Name";
+    SendMessageA(g_procList, LVM_INSERTCOLUMNA, 0, (LPARAM)&col);
+    col.pszText = (LPSTR)"Value";
+    SendMessageA(g_procList, LVM_INSERTCOLUMNA, 1, (LPARAM)&col);
+    SendMessageA(g_procList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    addProcRowsOnce(g_procList);
+    g_procItems = true;
+    ShowWindow(g_procWin, SW_SHOW);
+    refreshProcWin();
+    return true;
+}
+
 // worker-поток прогона (F5): завершение уведомляет главное окно
-static DWORD WINAPI runThreadProc(LPVOID) {
-    emuapi_run();
+static DWORD WINAPI runThreadProc(LPVOID) {    emuapi_run();
     g_runBusy = false;
     if (g_main) PostMessageA(g_main, WM_APP + 1, 0, 0);
     return 0;
@@ -852,6 +952,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 case IDM_DBG_START:      // Start Debugging
                     startDebugging();
                     refreshIoListView();
+            refreshProcWin();
                     return 0;
                 case IDM_DBG_RUN:        // Run (F5) - worker-поток, UI живёт
                     if (!g_coreInit) { msgAppend("! Прогон: сначала Debug > Start Debugging (Ctrl+Shift+Alt+F5)"); return 0; }
@@ -865,21 +966,25 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     msgAppend("-- Break");
                     return 0;
                 case IDM_DBG_RESET:      // Reset (Shift+F5)
-                    if (g_coreInit) { emuapi_reset(); refreshIoListView(); }
+                    if (g_coreInit) { emuapi_reset(); refreshIoListView();
+            refreshProcWin(); }
                     return 0;
                 case IDM_DBG_STEPIN:     // Step Into (F11) = машинный шаг
                     if (!g_coreInit || !emuapi_loaded()) { msgAppend("! Сначала Debug > Start Debugging"); return 0; }
-                    if (emuapi_stepInstrs(1)) { refreshIoListView(); }
+                    if (emuapi_stepInstrs(1)) { refreshIoListView();
+            refreshProcWin(); }
                     return 0;
                 case IDM_DBG_STEPOVER:   // Step Over (F10) = C-строка over (DWARF)
                     if (!g_coreInit || !emuapi_loaded()) { msgAppend("! Сначала Debug > Start Debugging"); return 0; }
                     emuapi_cmd("next");
                     refreshIoListView();
+            refreshProcWin();
                     return 0;
                 case IDM_DBG_STEPOUT:    // Step Out (Shift+F11)
                     if (!g_coreInit || !emuapi_loaded()) { msgAppend("! Сначала Debug > Start Debugging"); return 0; }
                     emuapi_cmd("finish");
                     refreshIoListView();
+            refreshProcWin();
                     return 0;
                 case IDM_DBG_STOP:       // Stop Debugging
                     emuapi_stop();
@@ -911,12 +1016,15 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                         else msgAppend("-- Cleaned: main.elf не найден");
                     }
                     return 0;
+                // ---- View ----
+                case IDM_VIEW_PROC:
+                    showProcWin(h);
+                    return 0;
                 // ---- File ----
                 case IDM_FILE_SAVE:
                 case IDM_FILE_SAVEALL:
                     saveEditor();
-                    return 0;
-                case IDM_FILE_PRINT:
+                    return 0;                case IDM_FILE_PRINT:
                 case IDM_FILE_PRINTSETUP:
                 case IDM_FILE_CLOSE:
                 case IDM_FILE_SAVEAS:
@@ -930,6 +1038,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         case WM_APP + 1:  // прогон завершён (из worker-потока)
             refreshIoListView();
+            refreshProcWin();
             msgAppend("-- Run ended");
             return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
