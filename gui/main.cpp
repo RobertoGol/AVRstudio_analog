@@ -7,6 +7,9 @@
 #include <shellapi.h>
 #include <stdio.h>
 #include <string>
+#include <atomic>
+
+#include "emu_api.h"   // ядро эмулятора встроено в процесс (build/emu.cpp, EMU_LIB)
 
 // перехватчик необработанных исключений (пишет код/адрес в avrgui.log)
 static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
@@ -128,9 +131,78 @@ static void fillIoTree(HWND tv) {
 
 // ------------------------------------------------------------ Message panel
 static void msgAppend(const char* line) {
-    int len = GetWindowTextLengthA(g_msgs);
-    SendMessageA(g_msgs, EM_SETSEL, len, len);
-    SendMessageA(g_msgs, EM_REPLACESEL, FALSE, (LPARAM)line);
+    static int winLen = 4096;
+    int n = GetWindowTextLengthA(g_msgs);
+    if (n < 0) n = 0;
+    std::string cur(n, 0);
+    if (n > 0) {
+        // WM_SETTEXT работает с read-only окном без фокуса, в отличие от EM_REPLACESEL
+        SendMessageA(g_msgs, WM_GETTEXT, n + 1, (LPARAM)&cur[0]);
+        if (!cur.empty() && cur.back() != '\n') cur += "\r\n";
+    }
+    cur += line;
+    SendMessageA(g_msgs, WM_SETTEXT, 0, (LPARAM)cur.c_str());
+    (void)winLen;
+}
+
+// ------------------------------------------------------------- Ядро эмулятора
+static bool g_coreInit = false;                    // emuapi_init выполнен
+static std::atomic<bool> g_runBusy(false);         // работает worker-поток прогона
+static std::string g_projRoot;                     // корень проекта (echo.ctos + Procs/)
+static char g_valText[16];                         // буфер строк для ListView (должен жить)
+
+static void uiAppend(const char* s) {              // вывод ядра -> Message-панель
+    msgAppend(s);
+}
+
+static void debugStateLine() {
+    static char line[128];
+    snprintf(line, sizeof(line), "PC=0x%04X  SP=0x%04X  SREG=0x%02X  cycle=%llu",
+             emuapi_pc(), emuapi_sp(), emuapi_sreg(),
+             (unsigned long long)emuapi_cycles());
+    msgAppend(line);
+}
+
+// обновить правый I/O View значениями ядра (строки листа CPU-модуля)
+static void refreshIoListView() {
+    if (!g_coreInit) return;
+    for (int r = 0; r < 9; r++) {
+        const IoReg& ir = kCpuRegs[r];
+        uint8_t v = emuapi_readSram(0x20 + ir.ioAddr);
+        snprintf(g_valText, sizeof(g_valText), "0x%02X", v);
+        LVITEMA it = {0};
+        it.mask = LVIF_TEXT; it.iItem = r; it.iSubItem = 2; it.pszText = g_valText;
+        SendMessageA(g_ioList, LVM_SETITEMA, 0, (LPARAM)&it);
+    }
+    debugStateLine();
+}
+
+// worker-поток прогона (F5): завершение уведомляет главное окно
+static DWORD WINAPI runThreadProc(LPVOID) {
+    emuapi_run();
+    g_runBusy = false;
+    if (g_main) PostMessageA(g_main, WM_APP + 1, 0, 0);
+    return 0;
+}
+
+// старт отладки: инициализация ядра + загрузка ELF
+static void startDebugging() {
+    if (g_runBusy) { msgAppend("-- Прогон уже работает (Break = Ctrl+F5)"); return; }
+    if (!g_coreInit) {
+        // корень проекта: GUI exe живёт в <root>/gui, значит root = его родитель.
+        // (в финальной портативной сборке будет unpack-каталог)
+        char exePath[MAX_PATH]; GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        std::string d = exePath;
+        size_t sl = d.find_last_of("\\/");         d = d.substr(0, sl);             // снимаем имя exe -> /gui
+        sl = d.find_last_of("\\/");  if (sl != std::string::npos) g_projRoot = d.substr(0, sl); else g_projRoot = ".";
+        emuapi_sink(uiAppend);
+        emuapi_init(g_projRoot.c_str(), (g_projRoot + "/main.elf").c_str());
+        g_coreInit = true;
+        msgAppend((std::string("Core: chip=") + emuapi_chip() +
+                   "  F_CPU=" + std::to_string(emuapi_fcpu()) + " Hz").c_str());
+    }
+    if (!emuapi_loaded() && !emuapi_load()) return;
+    msgAppend("-- Debugging started (SIMULATOR)");
 }
 
 // ------------------------------------------------------------------ Status
@@ -193,14 +265,56 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int id = LOWORD(w);
             if (id == IDM_FILE_EXIT) { PostQuitMessage(0); return 0; }
             if (id == IDM_HELP_ABOUT) {
-                MessageBoxA(h, "AVR CLI Studio - замена AVR Studio 4.\n"
-                               "GUI + нативный эмулятор C++.\nmilestone M1: каркас.",
+                MessageBoxA(h, "AVR CLI Studio - бесплатный аналог AVR Studio 4.\n"
+                               "GUI + нативный эмулятор C++ (ядро встроено в процесс).",
                             "About AVR Studio...", MB_OK);
                 return 0;
+            }
+            switch (id) {
+                case IDM_DBG_START:      // Start Debugging
+                    startDebugging();
+                    refreshIoListView();
+                    return 0;
+                case IDM_DBG_RUN:        // Run (F5) - worker-поток, UI живёт
+                    if (!g_coreInit) { msgAppend("! Прогон: сначала Debug > Start Debugging (Ctrl+Shift+Alt+F5)"); return 0; }
+                    if (g_runBusy) { msgAppend("-- Run уже идёт (Break = Ctrl+F5)"); return 0; }
+                    g_runBusy = true;
+                    msgAppend("-- Run (F5)...");
+                    CloseHandle(CreateThread(nullptr, 0, runThreadProc, nullptr, 0, nullptr));
+                    return 0;
+                case IDM_DBG_BREAK:      // Break (Ctrl+F5)
+                    emuapi_stop();
+                    msgAppend("-- Break");
+                    return 0;
+                case IDM_DBG_RESET:      // Reset (Shift+F5)
+                    if (g_coreInit) { emuapi_reset(); refreshIoListView(); }
+                    return 0;
+                case IDM_DBG_STEPIN:     // Step Into (F11) = машинный шаг
+                    if (!g_coreInit || !emuapi_loaded()) { msgAppend("! Сначала Debug > Start Debugging"); return 0; }
+                    if (emuapi_stepInstrs(1)) { refreshIoListView(); }
+                    return 0;
+                case IDM_DBG_STEPOVER:   // Step Over (F10) = C-строка over (DWARF)
+                    if (!g_coreInit || !emuapi_loaded()) { msgAppend("! Сначала Debug > Start Debugging"); return 0; }
+                    emuapi_cmd("next");
+                    refreshIoListView();
+                    return 0;
+                case IDM_DBG_STEPOUT:    // Step Out (Shift+F11)
+                    if (!g_coreInit || !emuapi_loaded()) { msgAppend("! Сначала Debug > Start Debugging"); return 0; }
+                    emuapi_cmd("finish");
+                    refreshIoListView();
+                    return 0;
+                case IDM_DBG_STOP:       // Stop Debugging
+                    emuapi_stop();
+                    msgAppend("-- Debugging stopped");
+                    return 0;
             }
             msgAppend((std::string("[menu] id=") + std::to_string(id)).c_str());
             return 0;
         }
+        case WM_APP + 1:  // прогон завершён (из worker-потока)
+            refreshIoListView();
+            msgAppend("-- Run ended");
+            return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -399,7 +513,25 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     ShowWindow(g_main, nShow);
     UpdateWindow(g_main);
 
+    // акселераторы как в AS4 (подписи в меню): F5 Run, F10 Step Over, F11 Step Into,
+    // Shift+F5 Reset, Ctrl+F5 Break
+    ACCEL acc[] = {
+        { FVIRTKEY,                VK_F5, IDM_DBG_RUN    },
+        { FVIRTKEY | FSHIFT,       VK_F5, IDM_DBG_RESET  },
+        { FVIRTKEY | FCONTROL,     VK_F5, IDM_DBG_BREAK  },
+        { FVIRTKEY,                VK_F10, IDM_DBG_STEPOVER },
+        { FVIRTKEY,                VK_F11, IDM_DBG_STEPIN  },
+        { FVIRTKEY | FSHIFT,       VK_F11, IDM_DBG_STEPOUT },
+    };
+    HACCEL hacc = CreateAcceleratorTableA(acc, sizeof(acc)/sizeof(acc[0]));
+
     MSG msg;
-    while (GetMessageA(&msg, 0, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageA(&msg); }
+    while (GetMessageA(&msg, 0, 0, 0) > 0) {
+        if (!TranslateAcceleratorA(g_main, hacc, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+    }
+    DestroyAcceleratorTable(hacc);
     return (int)msg.wParam;
 }

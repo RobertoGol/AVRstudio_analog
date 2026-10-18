@@ -104,9 +104,14 @@ static std::string g_elf;    // path to elf file
 // ---------------------------------------------------------------------
 static HANDLE g_con = nullptr;
 enum CLR { GRAY=7, RED=12, GREEN=10, YELLOW=14, CYAN=11, DGREEN=2, DCYAN=3, DGRAY=8, WHITE=15, MAGENTA=13 };
+// GUI-встраивание: если g_sink установлен, весь вывод идёт туда (в окно Message),
+// консоль не трогается. Console build не задаёт g_sink - путь прежний.
+typedef void (*WrSinkFn)(const char* s);
+static WrSinkFn g_sink = nullptr;
 static void setColor(WORD c) { if(g_con) SetConsoleTextAttribute(g_con, c); }
 static void wr(const std::string& s, WORD c = GRAY, bool nl = true) {
     if (g_quiet) return;
+    if (g_sink) { g_sink(s.c_str()); if (nl) g_sink("\n"); return; }
     setColor(c);
     fputs(s.c_str(), stdout);
     if (nl) fputc('\n', stdout);
@@ -2386,6 +2391,9 @@ static std::string upper(std::string s) { for (auto& c : s) c = (char)toupper((u
 // ---------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------
+// main — только для консольной сборки; в GUI (EMU_LIB) не компилируется,
+// старт делается через emuapi_init()/emuapi_load() ниже
+#ifndef EMU_LIB
 static std::string exeDir() {
     char p[MAX_PATH]; GetModuleFileNameA(nullptr, p, MAX_PATH);
     std::string s = p; size_t sl = s.find_last_of("\\/"); if (sl != std::string::npos) s = s.substr(0, sl);
@@ -2432,3 +2440,91 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+#endif // !EMU_LIB
+
+#ifdef EMU_LIB
+// ==================== Тонкий API для встраивания ядра в GUI ====================
+// (декларации в gui/emu_api.h; компилируется только при EMU_LIB)
+void emuapi_sink(void (*fn)(const char*)) { g_sink = fn; }
+bool emuapi_init(const char* root, const char* elf) {
+    g_root = root ? root : ".";
+    g_elf  = (elf && *elf) ? elf : (g_root + "/main.elf");
+    g_con = nullptr;                       // консоль не используется
+    loadEnv();
+    return true;
+}
+bool emuapi_load() {
+    std::string err;
+    if (!loadElfSys(g_elf, err)) { wr("Load failed: " + err, RED); return false; }
+    resetInts(); snapPrev();
+    wr("Loaded: " + g_elf, GREEN);
+    return true;
+}
+bool emuapi_loaded() { return g_loaded; }
+void emuapi_stop() { g_running = false; }
+
+// пошагово без dump'a dash (панели GUI рисуют себя сами)
+bool emuapi_stepInstrs(int n) {
+    if (!g_loaded) { wr("! No program loaded.", RED); return false; }
+    for (int i = 0; i < n; i++) {
+        uint16_t op; int cy;
+        if (!execOne(op, cy)) return false;
+        tickInts(cy);
+        dispatchPending();
+    }
+    return true;
+}
+// прогон с брейкпойнтами; блокирующий - звать из worker-потока. 0=стоп/брейк
+int emuapi_run() {
+    if (!g_loaded) { wr("! No program loaded. Use: load", RED); return -1; }
+    uint64_t maxC = 100000000, cnt = 0;
+    g_running = true;
+    while (g_running && cnt < maxC) {
+        auto bi = g_bp.find(g_pc);
+        if (bi != g_bp.end()) {
+            wr(fmt("-- Breakpoint #%d hit at PC=0x%04X (cycle %llu)", bi->second, g_pc,
+                   (unsigned long long)g_cycles), RED);
+            g_running = false; break;
+        }
+        uint16_t op; int cy;
+        if (!execOne(op, cy)) break;
+        cnt++;
+        tickInts(cy);
+        if (dispatchPending()) cnt++;
+    }
+    g_running = false;
+    if (cnt >= maxC) wr(fmt("-- Run stopped at max-cycles limit (%llu).", (unsigned long long)maxC), YELLOW);
+    return 0;
+}
+void emuapi_reset() {
+    g_pc = 0; g_cycles = 0; g_running = false;
+    std::fill(g_dmem.begin(), g_dmem.end(), 0);
+    for (size_t i = 0; i < g_pio.size(); i++) { g_ext[i].mask = 0; g_ext[i].level = 0; }
+    g_dmem[0x5D] = RAM_END & 0xFF; g_dmem[0x5E] = (RAM_END >> 8) & 0xFF;
+    resetInts(); snapPrev();
+    wr("Reset done.", GREEN);
+}
+bool emuapi_cmd(const char* line) { return dispatch(line); }   // Step Over/Out и пр. через dispatch
+bool emuapi_findReg(const char* name, int* sramAddr) {
+    auto it = g_regmap.find(lower(name));
+    if (it == g_regmap.end()) return false;
+    *sramAddr = it->second; return true;
+}
+uint8_t emuapi_readSram(int a) { return readDmem(a); }
+void emuapi_writeIo(const char* name, int val) {
+    auto it = g_regmap.find(lower(name));
+    if (it == g_regmap.end()) { wr(fmt("! io: register %s not in [RegisterMap]", name), RED); return; }
+    writeDmem(it->second, val);
+}
+uint32_t emuapi_pc()     { return (uint32_t)g_pc; }
+uint64_t emuapi_cycles() { return g_cycles; }
+uint8_t  emuapi_sreg() {
+    return (uint8_t)((g_f.I<<7)|(g_f.T<<6)|(g_f.H<<5)|(g_f.S<<4)|(g_f.V<<3)|(g_f.N<<2)|(g_f.Z<<1)|g_f.C);
+}
+uint16_t emuapi_sp() { return (uint16_t)(g_dmem[0x5D] | (g_dmem[0x5E] << 8)); }
+const char* emuapi_chip() { return g_chip.c_str(); }
+unsigned    emuapi_fcpu() { return g_fcpu; }
+std::string emuapi_tioText() {
+    return g_tioTx.size() > 8192 ? g_tioTx.substr(g_tioTx.size() - 8192) : g_tioTx;
+}
+#endif // EMU_LIB
